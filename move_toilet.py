@@ -5,12 +5,10 @@ import threading
 import time
 import math
 
-# Adjust these variables to match your setup
-serial_port = 'COM3'  # Serial port Arduino is connected to (e.g., COM3 on Windows or /dev/ttyACM0 on Linux)
-baud_rate = 2000000  # Should match the baud rate in your Arduino sketch
-
 # Initialize serial connection
-ser = serial.Serial(serial_port, baud_rate)
+arduino_serial_port = 'COM3' 
+arduino_baud_rate = 2000000
+ser = serial.Serial(arduino_serial_port, arduino_baud_rate)
 
 pause_serial_reading = threading.Event()
 pause_serial_reading.set()
