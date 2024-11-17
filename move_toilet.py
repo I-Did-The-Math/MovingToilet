@@ -5,15 +5,26 @@ import threading
 import time
 import math
 
-# Initialize serial connection
+#Connect To Arduino
 arduino_serial_port = 'COM3' 
 arduino_baud_rate = 2000000
 ser = serial.Serial(arduino_serial_port, arduino_baud_rate)
 
-pause_serial_reading = threading.Event()
-pause_serial_reading.set()
+#Connect To GoPro
+obs_virtual_camera_index = 3 
+gopro_feed = cv2.VideoCapture(obs_virtual_camera_index, cv2.CAP_DSHOW)
+if not gopro_feed.isOpened():
+    print(f"Error: Could not open virtual camera at index {obs_virtual_camera_index}.")
+    exit()
+print(f"Successfully opened virtual camera at index {obs_virtual_camera_index}.")
 
-# Initialize global variables
+#Setup GoPro Feed Window
+gopro_feed_width = 1280
+gopro_feed_height = 720
+gopro_feed.set(cv2.CAP_PROP_FRAME_WIDTH, gopro_feed_width)
+gopro_feed.set(cv2.CAP_PROP_FRAME_HEIGHT, gopro_feed_height)
+
+#Initialize Global Variables
 encoder_position_x, encoder_position_y = 0.0, 0.0
 initial_position_x, initial_position_y = 0.0, 0.0
 stop_threads = False
@@ -22,18 +33,15 @@ velocity_x, velocity_y = 0.0, 0.0
 last_position_x, last_position_y = 0.0, 0.0
 last_velocity_check_time = time.time()
 reset_done = False
-
 direction_x, direction_y = 0, 0
 paused = True
 cursor_inside_bounds = True
 position_history = []
 velocity_magnitude_history = []
-
-# Adjust these variables to match your setup
-frame_width = 1280
-frame_height = 720
-
 move_requested = False
+
+pause_serial_reading = threading.Event()
+pause_serial_reading.set()
 
 def send_movement_command(ser, deltaX, deltaY):
     command = f"{deltaX},{deltaY}\n"
@@ -83,21 +91,6 @@ def real_world_to_pixel(real_world_point, H_inv):
     pixel_point /= pixel_point[2]  # Normalize by the third (homogeneous) coordinate
     return int(pixel_point[0, 0]), int(pixel_point[1, 0])
 
-# Replace with the correct index for the OBS virtual camera
-virtual_camera_index = 3  # Adjust this index if needed
-
-# Open the virtual camera
-cap = cv2.VideoCapture(virtual_camera_index, cv2.CAP_DSHOW)
-
-if not cap.isOpened():
-    print(f"Error: Could not open virtual camera at index {virtual_camera_index}.")
-    exit()
-
-print(f"Successfully opened virtual camera at index {virtual_camera_index}.")
-
-# Set the resolution
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, frame_width)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, frame_height)
 
 # Real life coordinates in meters (excluding height)
 real_life_coords = np.array([
@@ -162,6 +155,24 @@ def get_center_of_white_pixels(image):
 
     return center, mask
 
+def get_gopro_toilet_pixel_pos(toilet_frame):
+    center_toilet_pixel, thresh = get_center_of_white_pixels(toilet_frame)
+    if center_toilet_pixel is not None:
+        center_toilet_pixel = (center_toilet_pixel[0] + 10, center_toilet_pixel[1] - 140)
+    return center_toilet_pixel, thresh
+
+def get_gopro_toilet_real_pos(toilet_frame):
+    center_toilet_pixel, thresh = get_gopro_toilet_pixel_pos(toilet_frame)
+    return pixel_to_real_world(center_toilet_pixel, H), thresh
+
+def get_gopro_toilet_pos(toilet_frame):
+    center_toilet_pixel, thresh = get_center_of_white_pixels(toilet_frame)
+    real_toilet_pos = None
+    if center_toilet_pixel is not None:
+        center_toilet_pixel = (center_toilet_pixel[0] + 10, center_toilet_pixel[1] - 140)
+        real_toilet_pos = pixel_to_real_world(center_toilet_pixel, H)
+    return center_toilet_pixel, real_toilet_pos, thresh
+
 # Function to read serial data from Arduino
 def read_serial():
     global encoder_position_x, encoder_position_y, initial_position_x, initial_position_y, reset_position, velocity_x, velocity_y, last_position_x, last_position_y, last_velocity_check_time, reset_done
@@ -221,26 +232,20 @@ initial_position_set = False
 
 try:
     while True:
-        ret, frame = cap.read()
+        ret, frame = gopro_feed.read()
         if not ret:
             print("Error: Failed to capture image")
             break
 
-        # Get the center of the white pixels and the thresholded image
-        center, thresh = get_center_of_white_pixels(frame)
+        toilet_gopro_pixel_pos, toilet_gopro_real_pos, thresh = get_gopro_toilet_pos(frame)
 
-        if center is not None:
-            # Offset the center by -70 pixels in the y direction
-            offset_center = (center[0] + 10, center[1] - 140)
+        if toilet_gopro_pixel_pos is not None:
 
-            # Convert the offset pixel coordinates to real-life coordinates
-            real_x, real_y = pixel_to_real_world(offset_center, H)
-
-            # Check if 'R' is pressed to reset initial position
+            #update position using 
             key = cv2.waitKey(1) & 0xFF
             if key == ord('r') or not initial_position_set or (is_GoPro_Velocity_Still() and not reset_done and time.time() - last_velocity_check_time >= 0.1):
-                initial_position_x = real_x
-                initial_position_y = real_y
+                initial_position_x = toilet_gopro_real_pos[0]
+                initial_position_y = toilet_gopro_real_pos[1]
                 initial_position_set = True
                 reset_encoders()  # Reset encoders when setting the initial position
                 encoder_position_x = initial_position_x 
@@ -275,11 +280,11 @@ try:
                 velocity_x, velocity_y = 0, 0
 
              # Draw a circle at the offset center of the white pixels
-            cv2.circle(frame, offset_center, 5, (0, 255, 0), -1)
+            cv2.circle(frame, toilet_gopro_pixel_pos, 5, (0, 255, 0), -1)
 
             # Write the real-life coordinates on the frame for the GoPro position
-            text_real_life = f"GoPro Real Life: ({real_x:.2f} m, {real_y:.2f} m)"
-            cv2.putText(frame, text_real_life, (offset_center[0] + 20, offset_center[1] + 10), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 4)
+            text_real_life = f"GoPro Real Life: ({toilet_gopro_real_pos[0]:.2f} m, {toilet_gopro_real_pos[1]:.2f} m)"
+            cv2.putText(frame, text_real_life, (toilet_gopro_pixel_pos[0] + 20, toilet_gopro_pixel_pos[1] + 10), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 4)
 
             # Calculate the encoder position in pixel coordinates
             encoder_pixel_x, encoder_pixel_y = real_world_to_pixel((encoder_position_x, encoder_position_y), H_inv)
@@ -333,5 +338,5 @@ finally:
     stop_threads = True
     ser.close()  # Ensure the serial connection is closed before joining the thread
     serial_thread.join()
-    cap.release()
+    gopro_feed.release()
     cv2.destroyAllWindows()
