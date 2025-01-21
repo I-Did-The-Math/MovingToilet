@@ -12,7 +12,6 @@ real_world_height = 330
 class UIHandler:
     def __init__(self, toilet_controller):
         self.cursor_pixel_pos = [0,0]
-        self.cursor_real_pos = [0,0]
         self.toilet_controller = toilet_controller
         self.move_requested = False
         cv2.namedWindow('Video Stream')
@@ -26,17 +25,32 @@ class UIHandler:
         if magnitude == 0:
             return 0, 0
         return x / magnitude, y / magnitude
+    
+    def update_cursor_pos(self, x, y):
+        self.cursor_pixel_pos[0] = x * 2
+        self.cursor_pixel_pos[1] = y * 2
+        self.cursor_inside_bounds = cv2.pointPolygonTest(self.polygon, self.cursor_pixel_pos, False) >= 0
+
+    def get_real_cursor_pos(self):
+        return self.toilet_controller.pixel_to_real(self.cursor_pixel_pos[0], self.cursor_pixel_pos[1])
+
+    def get_toilet_cursor_real_deltas(self)
+        cursor_real_pos_x, cursor_real_pos_y = self.get_real_cursor_pos()
+        toilet_real_pos_x, toilet_real_pos_y = self.toilet_controller.get_real_pos()
+        cursor_real_delta_x = toilet_real_pos_x - cursor_real_pos_x
+        cursor_real_delta_y = toilet_real_pos_y - cursor_real_pos_y
+        return cursor_real_delta_x, cursor_real_delta_y
+    
+    def move_toilet_to_mouse(self):
+        cursor_real_delta_x, cursor_real_delta_y = self.get_toilet_cursor_real_deltas()
+        if self.cursor_inside_bounds:
+            self.toilet_controller.move(cursor_real_delta_x, cursor_real_delta_y)    
 
     def mouse_callback(self, event, x, y, flags, param):
         if event == cv2.EVENT_MOUSEMOVE:
-            self.cursor_pixel_pos[0] = x * 2
-            self.cursor_pixel_pos[1] = y * 2
-            
-            self.cursor_real_pos[0], self.cursor_real_pos[1] = self.toilet_controller.pixel_to_real(self.cursor_pixel_pos, self.toilet_controller.H)
-            self.cursor_inside_bounds = cv2.pointPolygonTest(polygon, self.cursor_pixel_pos, False) >= 0
-
-        if event == cv2.EVENT_LBUTTONDOWN:
-            self.toilet_controller.move()
+            self.update_cursor_pos(x,y)
+        if event == cv2.EVENT_LBUTTONDOWN:  
+            self.move_toilet_to_mouse()
 
     def display_feed(frame, thresh):
         frame_resized = cv2.resize(frame, (frame.shape[1] // 2, frame.shape[0] // 2))
@@ -47,24 +61,58 @@ class UIHandler:
         # Display the thresholded image
         cv2.imshow('Thresholded Image', thresh_resized)
 
-    def render_text(self):
-        cv2.circle(frame, toilet_gopro_pixel_pos, 5, (0, 255, 0), -1)
-        text_camera = f"Toilet Position In Camera: ({toilet_gopro_real_pos[0]:.2f} m, {toilet_gopro_real_pos[1]:.2f} m)"
-        cv2.putText(frame, text_camera, (toilet_gopro_pixel_pos[0] + 20, toilet_gopro_pixel_pos[1] + 10), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 4)
-        toilet_pixel_pos = real_world_to_pixel((toilet_real_pos[0], toilet_real_pos[1]), H_inv)
-        cv2.circle(frame, (toilet_pixel_pos[0], toilet_pixel_pos[1]), 5, (255, 0, 0), -1)
-        text_real = f"Toilet In Real Life: ({toilet_real_pos[0]:.2f} m, {toilet_real_pos[1]:.2f} m)"
-        cv2.putText(frame, text_real, (toilet_pixel_pos[0] + 20, toilet_pixel_pos[1] - 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 4)
-        arrow_color = (255, 0 , 0) if cursor_inside_bounds else (0, 0, 255)
-        cv2.arrowedLine(frame, (toilet_pixel_pos[0], toilet_pixel_pos[1]), (cursor_x, cursor_y), arrow_color, 2)
-        cv2.polylines(frame, [polygon], isClosed=True, color=(255, 255, 0), thickness=2)
-        predictedPixelLocation = real_world_to_pixel((toilet_real_pos[0] + delta_x, toilet_real_pos[1] + delta_y), H_inv)
-        cv2.circle(frame, predictedPixelLocation, 5, (0, 255, 0), -1)
-        future_toilet_inside_bounds[0] = cv2.pointPolygonTest(polygon, predictedPixelLocation, False) >= 0
+    def render_outdated_toilet_pos(self, gopro_image, render_data):
+        cv2.circle(gopro_image, (render_data['toilet_gopro_pixel_x'], render_data['toilet_gopro_pixel_y']), 5, (0, 255, 0), -1)
+        text_camera = f"Outdated Position: ({render_data['toilet_gopro_real_x']:.2f} m, {render_data['toilet_gopro_real_y']:.2f} m)"
+        cv2.putText(gopro_image, text_camera, (render_data['toilet_gopro_pixel_x'] + 20, render_data['toilet_gopro_pixel_y'] + 10), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 4)
+    
+    def render_correct_toilet_pos(self, gopro_image, render_data):
+        cv2.circle(gopro_image, (render_data['toilet_pixel_x'], render_data['toilet_pixel_y']), 5, (255, 0, 0), -1)
+        text_real = f"Toilet In Real Life: ({render_data['toilet_real_x']:.2f} m, {render_data['toilet_real_y']:.2f} m)"
+        cv2.putText(gopro_image, text_real, (render_data['toilet_pixel_x'] + 20, render_data['toilet_pixel_y'] - 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 4)
+
+    def render_arrow(self, gopro_image, render_data):
+        arrow_color = (255, 0 , 0) if self.cursor_inside_bounds else (0, 0, 255)
+        cursor_x = self.cursor_pixel_pos[0]
+        cursor_y = self.cursor_pixel_pos[1]
+        cv2.arrowedLine(gopro_image, (render_data['toilet_pixel_x'], render_data['toilet_pixel_y']), (self.cursor_x, cursor_y), arrow_color, 2)
+
+    def compute_render_data(self, gopro_image):
+        toilet_gopro_pixel_x, toilet_gopro_pixel_y, _ = self.toilet_controller.get_pixel_position(gopro_image)
+        toilet_gopro_real_x, toilet_gopro_real_y = self.toilet_controller.pixel_to_real(toilet_gopro_pixel_x, toilet_gopro_pixel_y)
+        
+        toilet_real_x, toilet_real_y = self.toilet_controller.get_real_position()
+        toilet_pixel_x, toilet_pixel_y = self.toilet_controller.real_to_pixel(toilet_real_x, toilet_real_y)
+
+        render_data = {
+            'toilet_gopro_pixel_x': toilet_gopro_pixel_x,
+            'toilet_gopro_pixel_y':toilet_gopro_pixel_y,
+            'toilet_gopro_real_x': toilet_gopro_real_x,
+            'toilet_gopro_real_y': toilet_gopro_real_y,
+            'toilet_real_x': toilet_real_x,
+            'toilet_real_y': toilet_real_y,
+            'toilet_pixel_x': toilet_pixel_x,
+            'toilet_pixel_y': toilet_pixel_y
+        }
+
+        return render_data
+
+    def render_bounds(self, gopro_image):
+        cv2.polylines(gopro_image, [self.polygon], isClosed=True, color=(255, 255, 0), thickness=2)
+
+    def draw_ui(self, gopro_image):
+
+        render_data = self.compute_render_data(gopro_image)
+
+        self.render_outdated_toilet_pos(gopro_image, render_data)
+        self.render_correct_toilet_pos(gopro_image, render_data)
+        self.render_arrow(gopro_image, render_data)
+        self.render_bounds(gopro_image)
+        self.display_feed(gopro_image, )
+        
 
 class ToiletController:
-    def __init__(self, arduino_handler, gopro_feed):
-        self.gopro_feed = gopro_feed
+    def __init__(self, arduino_handler):
         self.arduino_handler = arduino_handler
         self.real_pos = [0.0,0.0]
         self.init_pos = [0.0,0.0]
@@ -109,13 +157,13 @@ class ToiletController:
             self.last_pixel_pos[1] = pixel_y
             self.last_velocity_check_time = current_time
 
-    def resync_position(self, image):
-        self.set_initial_position(image)
+    def resync_position(self, gopro_image):
+        self.set_initial_position(gopro_image)
         self.arduino_handler.reset_encoders()
         self.update_real_position()
 
-    def set_initial_position(self, image):
-        pixel_x, pixel_y, _ = self.get_pixel_position(image)
+    def set_initial_position(self, gopro_image):
+        pixel_x, pixel_y, _ = self.get_pixel_position(gopro_image)
         real_x, real_y = self.pixel_to_real(pixel_x, pixel_y)
         self.init_pos[0] = real_x
         self.init_pos[1] = real_y
@@ -128,9 +176,13 @@ class ToiletController:
     def get_real_position(self):
         self.update_real_position()
         return self.real_pos[0], self.real_pos[1]
+    
+    def get_white_mask(self):
+        _, mask = self.center_of_white_pixels()
+        return self.center_of_white_pixels(self.gopro_image)
 
-    def center_of_white_pixels(self,image):
-        gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    def center_of_white_pixels(self,gopro_image):
+        gray_image = cv2.cvtColor(gopro_image, cv2.COLOR_BGR2GRAY)
         _, thresh = cv2.threshold(gray_image, 254, 255, cv2.THRESH_BINARY)
         kernel_size = 7
         kernel = np.ones((kernel_size, kernel_size), np.uint8)
@@ -147,8 +199,8 @@ class ToiletController:
         center = (int(center[1]), int(center[0]))  # (x, y) format
         return center, mask
     
-    def get_pixel_position(self,image):
-        center_toilet_pixel, thresh = self.center_of_white_pixels(image)
+    def get_pixel_position(self,gopro_image):
+        center_toilet_pixel, thresh = self.center_of_white_pixels(gopro_image)
         if center_toilet_pixel is not None:
             return center_toilet_pixel[0] + 10, center_toilet_pixel[1] - 140, thresh
         
@@ -184,8 +236,6 @@ class ToiletController:
 
         return False
     
-            
-
 class ArduinoHandler:
     def __init__(self):
         self.lock = threading.Lock()
