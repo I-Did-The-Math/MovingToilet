@@ -5,18 +5,7 @@ from collections import deque
 from ctypes import c_uint8
 import serial
 import threading
-
-#Start GoPro Camera
-gopro_frame_width = 1280
-gopro_frame_height = 720
-gopro_obs_camera_index = 3 
-gopro_feed = cv2.VideoCapture(gopro_obs_camera_index, cv2.CAP_DSHOW)
-if not gopro_feed.isOpened():
-    print(f"Error: Could not open virtual camera at index {gopro_obs_camera_index}.")
-    exit()
-print(f"Successfully opened virtual camera at index {gopro_obs_camera_index}.")
-gopro_feed.set(cv2.CAP_PROP_FRAME_WIDTH, gopro_frame_width)
-gopro_feed.set(cv2.CAP_PROP_FRAME_HEIGHT, gopro_frame_height)
+import time
 
 #Start Depth Camera
 pipeline = rs.pipeline()
@@ -47,24 +36,86 @@ arduino_baud_rate = 2000000
 arduino = serial.Serial(arduino_serial_port, arduino_baud_rate)
 pee_initial_speed = 0.0
 
+#multithreading
+data_lock = time.Lock()
+
+#toilet info
+toilet_real_pos = [0.0,0.0]
+initial_position_x, initial_position_y = 0.0, 0.0
+stop_threads = False
+reset_position = False
+velocity_x, velocity_y = 0.0, 0.0
+last_position_x, last_position_y = 0.0, 0.0
+last_velocity_check_time = time.time()
+reset_done = False
+direction_x, direction_y = 0, 0
+paused = True
+cursor_inside_bounds = True
+position_history = []
+velocity_magnitude_history = []
+move_requested = False
+
 def calculate_smoothed_angle(new_angle, angle_deque):
     angle_deque.append(new_angle)
     return sum(angle_deque) / len(angle_deque)
 
-def read_velocity():
-    global pee_initial_speed
+def calculate_gopro_toilet_velocity():
+    
+
+def sync_arduino_to_gopro_position(toilet_gopro_real_pos, key):
+    global initial_position_set, initial_position_x, initial_position_y, last_position_x, last_position_y, reset_done, toilet_real_pos, last_velocity_check_time
+    
+    if key == ord('r') or not initial_position_set or (is_GoPro_Velocity_Still() and not reset_done and time.time() - last_velocity_check_time >= 0.1):
+        initial_position_x = toilet_gopro_real_pos[0]
+        initial_position_y = toilet_gopro_real_pos[1]
+        initial_position_set = True
+        reset_encoders()  # Reset encoders when setting the initial position
+        toilet_real_pos[0] = initial_position_x
+        toilet_real_pos[1] = initial_position_y
+        last_position_x = toilet_real_pos[0]
+        last_position_y = toilet_real_pos[1]
+        reset_done = True
+        print("Initial position set/reset to GoPro position")
+        print(f"Encoder Position Updated: X: {toilet_real_pos[0]:.2f} m, Y: {toilet_real_pos[1]:.2f} m")
+
+    if not is_GoPro_Velocity_Still():
+        reset_done = False
+
+def read_arduino_serial_data():
+    global pee_initial_speed, toilet_real_pos, initial_position_x, initial_position_y, reset_position, velocity_x, velocity_y, last_position_x, last_position_y, last_velocity_check_time, reset_done
     while True:
         try:
             # Read the serial data from Arduino
             line = arduino.readline().decode('utf-8').strip()
-            print(f"Received line: {line}")  # Debug print to verify serial data
-            if "V:" in line:
-                pee_initial_speed = float(line.split(" ")[1])
+            print(f"Received line: {line}")
+
+            with data_lock:
+                if line.startswith("V:"):
+                    pee_initial_speed = float(line.split(" ")[1])
+                elif line.startswith("X,"):
+                    parts = line.split(",")
+                    delta_x = float(parts[1]) 
+                    delta_x *= 0.9
+                    delta_y = float(parts[3])  
+
+                    toilet_real_pos[0] = initial_position_x + delta_x
+                    toilet_real_pos[1] = initial_position_y + delta_y
+
+                    current_time = time.time()
+                    time_diff = current_time - last_velocity_check_time
+                    if time_diff >= 0.1:
+                        velocity_x = (toilet_real_pos[0] - last_position_x) / time_diff
+                        velocity_y = (toilet_real_pos[1] - last_position_y) / time_diff
+                        last_position_x = toilet_real_pos[0]
+                        last_position_y = toilet_real_pos[1]
+                        last_velocity_check_time = current_time
         except Exception as e:
             print(f"Error: {e}")
 
+            
+
 # Start the thread to read velocity
-thread = threading.Thread(target=read_velocity)
+thread = threading.Thread(target=read_arduino_serial_data)
 thread.daemon = True
 thread.start()
 

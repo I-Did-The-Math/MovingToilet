@@ -59,7 +59,7 @@ thread.start()
 # Start the Tkinter update loop
 update_gui()
 root.mainloop()
-=======
+
 import serial
 import tkinter as tk
 import threading

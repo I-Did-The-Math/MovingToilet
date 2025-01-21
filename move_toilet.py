@@ -4,11 +4,12 @@ import serial
 import threading
 import time
 import math
+import keyboard
 
 #Connect To Arduino
 arduino_serial_port = 'COM3' 
 arduino_baud_rate = 2000000
-ser = serial.Serial(arduino_serial_port, arduino_baud_rate)
+arduino = serial.Serial(arduino_serial_port, arduino_baud_rate)
 
 #Connect To GoPro
 obs_virtual_camera_index = 3 
@@ -25,7 +26,7 @@ gopro_feed.set(cv2.CAP_PROP_FRAME_WIDTH, gopro_feed_width)
 gopro_feed.set(cv2.CAP_PROP_FRAME_HEIGHT, gopro_feed_height)
 
 #Initialize Global Variables
-encoder_position_x, encoder_position_y = 0.0, 0.0
+toilet_real_pos = [0.0,0.0]
 initial_position_x, initial_position_y = 0.0, 0.0
 stop_threads = False
 reset_position = False
@@ -43,6 +44,12 @@ move_requested = False
 pause_serial_reading = threading.Event()
 pause_serial_reading.set()
 
+toilet_gopro_pixel_pos = [0,0]
+toilet_gopro_real_pos = [0,0]
+thresh = None
+
+lock = threading.Lock()
+
 def send_movement_command(ser, deltaX, deltaY):
     command = f"{deltaX},{deltaY}\n"
     ser.write(command.encode())
@@ -53,13 +60,13 @@ def wait_for_completion(ser):
         response = ser.readline().decode().strip()
         if response:
             print(response)
-            if "Movement completed in" in response:
+            if "done" in response:
                 break
 
 def move_delta(deltaX, deltaY):
     pause_serial_reading.clear()
-    send_movement_command(ser, deltaX, deltaY)
-    wait_for_completion(ser)
+    send_movement_command(arduino, deltaX, deltaY)
+    wait_for_completion(arduino)
     pause_serial_reading.set()
 
 def normalize_vector(x, y):
@@ -166,52 +173,54 @@ def get_gopro_toilet_real_pos(toilet_frame):
     return pixel_to_real_world(center_toilet_pixel, H), thresh
 
 def get_gopro_toilet_pos(toilet_frame):
-    center_toilet_pixel, thresh = get_center_of_white_pixels(toilet_frame)
-    real_toilet_pos = None
-    if center_toilet_pixel is not None:
-        center_toilet_pixel = (center_toilet_pixel[0] + 10, center_toilet_pixel[1] - 140)
-        real_toilet_pos = pixel_to_real_world(center_toilet_pixel, H)
-    return center_toilet_pixel, real_toilet_pos, thresh
+    center_gopro_toilet_pixel, thresh = get_center_of_white_pixels(toilet_frame)
+    real_gopro_toilet_pos = None
+    if center_gopro_toilet_pixel is not None:
+        center_gopro_toilet_pixel = (center_gopro_toilet_pixel[0] + 10, center_gopro_toilet_pixel[1] - 140)
+        real_gopro_toilet_pos = pixel_to_real_world(center_gopro_toilet_pixel, H)
+    return center_gopro_toilet_pixel, real_gopro_toilet_pos, thresh
 
-# Function to read serial data from Arduino
-def read_serial():
-    global encoder_position_x, encoder_position_y, initial_position_x, initial_position_y, reset_position, velocity_x, velocity_y, last_position_x, last_position_y, last_velocity_check_time, reset_done
-    while not stop_threads:
-        pause_serial_reading.wait()
-        try:
-            line = ser.readline().decode('utf-8').strip()
-            if line.startswith("X,"):
-                try:
-                    parts = line.split(",")
-                    delta_x = float(parts[1]) 
-                    delta_x *= 0.9
-                    delta_y = float(parts[3])  
+def get_toilet_velocity():
+    global velocity_x, velocity_y, last_position_x, last_position_y
+    current_time = time.time()
+    time_diff = current_time - last_velocity_check_time
+    if time_diff >= 0.1:
+        velocity_x = (toilet_real_pos[0] - last_position_x) / time_diff
+        velocity_y = (toilet_real_pos[1] - last_position_y) / time_diff
+        last_position_x = toilet_real_pos[0]
+        last_position_y = toilet_real_pos[1]
+        last_velocity_check_time = current_time
 
-                    encoder_position_x = initial_position_x + delta_x
-                    encoder_position_y = initial_position_y + delta_y
+#def update_gopro_toilet_velocity():
+     # Update the position history
+   # global position_history, toilet_real_pos,
+   # current_time = time.time()
+   # position_history.append((toilet_real_pos[0], toilet_real_pos[1], current_time))
+   # if len(position_history) > 3:
+    #    position_history.pop(0)
 
-                    current_time = time.time()
-                    time_diff = current_time - last_velocity_check_time
-                    if time_diff >= 0.1:
-                        velocity_x = (encoder_position_x - last_position_x) / time_diff
-                        velocity_y = (encoder_position_y - last_position_y) / time_diff
-                        last_position_x = encoder_position_x
-                        last_position_y = encoder_position_y
-                        last_velocity_check_time = current_time
+    # Calculate the velocity based on the change in position over the last three frames
+   # if len(position_history) == 3:
+    #    dt = position_history[-1][2] - position_history[0][2]
+    #    dx = position_history[-1][0] - position_history[0][0]
+    #    dy = position_history[-1][1] - position_history[0][1]
+    #    velocity_x = dx / dt
+    #    velocity_y = dy / dt
+    #else:
+    #    velocity_x, velocity_y = 0, 0
 
-                    print(f"Encoder Position Updated: X: {encoder_position_x:.2f} m, Y: {encoder_position_y:.2f} m")
-                    print(f"Velocity: X: {velocity_x:.2f} m/s, Y: {velocity_y:.2f} m/s")
-                except ValueError:
-                    pass  # Handle conversion error if data is incomplete or corrupted
-        except UnicodeDecodeError:
-            continue  # Skip any lines that cause a UnicodeDecodeError
+
+def add_encoder_deltas_to_initial_position(delta_x,delta_y):
+    toilet_real_pos[0] = initial_position_x + delta_x
+    toilet_real_pos[1] = initial_position_y + delta_y
+
+
 
 def reset_encoders():
-    ser.write(b"RESET_ENCODERS\n")
+    arduino.write(b"RESET_ENCODERS\n")
     time.sleep(0.1)  # Wait for the Arduino to process the command
 
-def is_GoPro_Velocity_Still():
-    global velocity_x, velocity_y
+def is_Toilet_Still():
     return abs(velocity_x) < 0.01 and abs(velocity_y) < 0.01
 
 # Initialize variables
@@ -220,9 +229,9 @@ cursor_real_x, cursor_real_y = 0, 0
 move_requested = False
 
 # Start the serial reading thread
-serial_thread = threading.Thread(target=read_serial)
-serial_thread.daemon = True
-serial_thread.start()
+#serial_thread = threading.Thread(target=read_serial)
+#serial_thread.daemon = True
+#serial_thread.start()
 
 cv2.namedWindow('Video Stream')
 cv2.setMouseCallback('Video Stream', mouse_callback)
@@ -230,113 +239,157 @@ cv2.setMouseCallback('Video Stream', mouse_callback)
 # Set initial position based on GoPro
 initial_position_set = False
 
+def set_initial_position_to_gopro():
+    global initial_position_set, initial_position_x, initial_position_y
+    initial_position_x = toilet_gopro_real_pos[0]
+    initial_position_y = toilet_gopro_real_pos[1]
+    initial_position_set = True
+
+def sync_arduino_to_gopro_position(toilet_gopro_real_pos):
+    last_position_x, last_position_y, reset_done, toilet_real_pos, last_velocity_check_time
+
+    set_initial_position_to_gopro()
+    
+    reset_encoders()  # Reset encoders when setting the initial position
+    toilet_real_pos[0] = initial_position_x
+    toilet_real_pos[1] = initial_position_y
+    last_position_x = toilet_real_pos[0]
+    last_position_y = toilet_real_pos[1]
+    reset_done = True
+    print(f"Position Resynced Using GoPro: X: {toilet_real_pos[0]:.2f} m, Y: {toilet_real_pos[1]:.2f} m")
+
+    if not is_Toilet_Still():
+        reset_done = False
+
+
+
+def render_text(frame, toilet_gopro_real_pos, toilet_gopro_pixel_pos, delta_x, delta_y, future_toilet_inside_bounds):
+    global toilet_real_pos, cursor_inside_bounds, cursor_x, cursor_y, polygon, cursor_real_x, cursor_real_y
+     # Draw a circle at the offset center of the white pixels
+    cv2.circle(frame, toilet_gopro_pixel_pos, 5, (0, 255, 0), -1)
+
+    # Write the real-life coordinates on the frame for the GoPro position
+    text_camera = f"Toilet Position In Camera: ({toilet_gopro_real_pos[0]:.2f} m, {toilet_gopro_real_pos[1]:.2f} m)"
+    cv2.putText(frame, text_camera, (toilet_gopro_pixel_pos[0] + 20, toilet_gopro_pixel_pos[1] + 10), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 4)
+
+    # Calculate the encoder position in pixel coordinates
+    toilet_pixel_pos = real_world_to_pixel((toilet_real_pos[0], toilet_real_pos[1]), H_inv)
+
+    # Draw a circle at the encoder position
+    cv2.circle(frame, (toilet_pixel_pos[0], toilet_pixel_pos[1]), 5, (255, 0, 0), -1)
+
+    # Write the real-life coordinates on the frame for the encoder position
+    text_real = f"Toilet In Real Life: ({toilet_real_pos[0]:.2f} m, {toilet_real_pos[1]:.2f} m)"
+    cv2.putText(frame, text_real, (toilet_pixel_pos[0] + 20, toilet_pixel_pos[1] - 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 4)
+
+    # Check if the cursor is inside the polygon
+    arrow_color = (255, 0 , 0) if cursor_inside_bounds else (0, 0, 255)
+
+    # Draw an arrow from the toilet to the cursor
+    cv2.arrowedLine(frame, (toilet_pixel_pos[0], toilet_pixel_pos[1]), (cursor_x, cursor_y), arrow_color, 2)
+
+    # Draw the polygon
+    cv2.polylines(frame, [polygon], isClosed=True, color=(255, 255, 0), thickness=2)
+
+    predictedPixelLocation = real_world_to_pixel((toilet_real_pos[0] + delta_x, toilet_real_pos[1] + delta_y), H_inv)
+    #check if toilet would be moved outside bounds, if not then MOVE
+    cv2.circle(frame, predictedPixelLocation, 5, (0, 255, 0), -1)
+
+    future_toilet_inside_bounds[0] = cv2.pointPolygonTest(polygon, predictedPixelLocation, False) >= 0
+
+    
+def display_feed(frame, thresh):
+    frame_resized = cv2.resize(frame, (frame.shape[1] // 2, frame.shape[0] // 2))
+    thresh_resized = cv2.resize(thresh, (thresh.shape[1] // 2, thresh.shape[0] // 2))
+
+    # Display the original frame with the detected white pixels
+    cv2.imshow('Video Stream', frame_resized)
+    # Display the thresholded image
+    cv2.imshow('Thresholded Image', thresh_resized)
+
+def is_gopro_toilet_position_accurate():
+    return not initial_position_set or (is_Toilet_Still() and time.time() - last_velocity_check_time >= 0.1)
+
+
+def get_toilet_position(gopro_frame):
+    global toilet_gopro_pixel_pos, toilet_gopro_real_pos, thresh
+
+    toilet_gopro_pixel_pos, toilet_gopro_real_pos, thresh = get_gopro_toilet_pos(gopro_frame)
+
+    #delta_x, delta_y = read_arduino_encoder_data()
+    add_encoder_deltas_to_initial_position(delta_x, delta_y)
+
+    if keyboard.is_pressed('r') or is_gopro_toilet_position_accurate():
+        sync_arduino_to_gopro_position(toilet_gopro_real_pos)
+
+
+def read_arduino_encoder_data():
+    global delta_x, delta_y
+    while True:
+        with lock:
+            line = arduino.readline().decode('utf-8').strip()
+            print(f"Received line: {line}")
+            if "X," in line:
+                parts = line.split(",")
+                delta_x = float(parts[1]) 
+                delta_x *= 0.9
+                delta_y = float(parts[3])  
+
+
+def read_velocity():
+    global pee_initial_speed
+    while True:
+        try:
+            # Read the serial data from Arduino
+            line = arduino.readline().decode('utf-8').strip()
+            print(f"Received line: {line}")  # Debug print to verify serial data
+            if "V:" in line:
+                pee_initial_speed = float(line.split(" ")[1])
+        except Exception as e:
+            print(f"Error: {e}")
+
+# Start the thread to read velocity
+#thread = threading.Thread(target = read_velocity)
+#thread.daemon = True
+#thread.start()
+
+thread = threading.Thread(target = read_arduino_encoder_data)
+thread.daemon = True
+thread.start()
+
 try:
     while True:
-        ret, frame = gopro_feed.read()
+        ret, gopro_frame = gopro_feed.read()
         if not ret:
             print("Error: Failed to capture image")
-            break
 
-        toilet_gopro_pixel_pos, toilet_gopro_real_pos, thresh = get_gopro_toilet_pos(frame)
+        get_toilet_position(gopro_frame)
 
-        if toilet_gopro_pixel_pos is not None:
+        delta_x = cursor_real_x - toilet_real_pos[0]
+        delta_y = cursor_real_y - toilet_real_pos[1]
 
-            #update position using 
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('r') or not initial_position_set or (is_GoPro_Velocity_Still() and not reset_done and time.time() - last_velocity_check_time >= 0.1):
-                initial_position_x = toilet_gopro_real_pos[0]
-                initial_position_y = toilet_gopro_real_pos[1]
-                initial_position_set = True
-                reset_encoders()  # Reset encoders when setting the initial position
-                encoder_position_x = initial_position_x 
-                encoder_position_y = initial_position_y
-                last_position_x = encoder_position_x
-                last_position_y = encoder_position_y
-                reset_done = True
-                print("Initial position set/reset to GoPro position")
-                print(f"Encoder Position Updated: X: {encoder_position_x:.2f} m, Y: {encoder_position_y:.2f} m")
+        future_toilet_inside_bounds = [False]
+        render_text(gopro_frame, toilet_gopro_real_pos, toilet_gopro_pixel_pos, delta_x, delta_y, future_toilet_inside_bounds)
 
-            if not is_GoPro_Velocity_Still():
-                reset_done = False
+        if move_requested:
+            print("movement requested")
+            if future_toilet_inside_bounds[0]:
+                print("movement sent")
+                move_delta(delta_x, delta_y)
+                print("movement completed")
+                move_requested = False
 
-            # Calculate the vector from the toilet to the cursor using encoder position
-            vector_x = cursor_real_x - encoder_position_x
-            vector_y = cursor_real_y - encoder_position_y
-
-            # Update the position history
-            current_time = time.time()
-            position_history.append((encoder_position_x, encoder_position_y, current_time))
-            if len(position_history) > 3:
-                position_history.pop(0)
-
-            # Calculate the velocity based on the change in position over the last three frames
-            if len(position_history) >= 3:
-                dt = position_history[-1][2] - position_history[0][2]
-                dx = position_history[-1][0] - position_history[0][0]
-                dy = position_history[-1][1] - position_history[0][1]
-                velocity_x = dx / dt
-                velocity_y = dy / dt
-            else:
-                velocity_x, velocity_y = 0, 0
-
-             # Draw a circle at the offset center of the white pixels
-            cv2.circle(frame, toilet_gopro_pixel_pos, 5, (0, 255, 0), -1)
-
-            # Write the real-life coordinates on the frame for the GoPro position
-            text_real_life = f"GoPro Real Life: ({toilet_gopro_real_pos[0]:.2f} m, {toilet_gopro_real_pos[1]:.2f} m)"
-            cv2.putText(frame, text_real_life, (toilet_gopro_pixel_pos[0] + 20, toilet_gopro_pixel_pos[1] + 10), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 4)
-
-            # Calculate the encoder position in pixel coordinates
-            encoder_pixel_x, encoder_pixel_y = real_world_to_pixel((encoder_position_x, encoder_position_y), H_inv)
-
-            # Draw a circle at the encoder position
-            cv2.circle(frame, (encoder_pixel_x, encoder_pixel_y), 5, (255, 0, 0), -1)
-
-            # Write the real-life coordinates on the frame for the encoder position
-            text_encoder_life = f"Encoder Real Life: ({encoder_position_x:.2f} m, {encoder_position_y:.2f} m)"
-            cv2.putText(frame, text_encoder_life, (encoder_pixel_x + 20, encoder_pixel_y - 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 4)
-
-            # Check if the cursor is inside the polygon
-            arrow_color = (255, 0 , 0) if cursor_inside_bounds else (0, 0, 255)
-
-            # Draw an arrow from the toilet to the cursor
-            cv2.arrowedLine(frame, (encoder_pixel_x, encoder_pixel_y), (cursor_x, cursor_y), arrow_color, 2)
-
-            # Draw the polygon
-            cv2.polylines(frame, [polygon], isClosed=True, color=(255, 255, 0), thickness=2)
-
-            delta_x = cursor_real_x - encoder_position_x
-            delta_y = cursor_real_y - encoder_position_y
-
-            predictedPixelLocation = real_world_to_pixel((encoder_position_x + delta_x, encoder_position_y + delta_y), H_inv)
-            #check if toilet would be moved outside bounds, if not then MOVE
-            future_toilet_inside_bounds = cv2.pointPolygonTest(polygon, predictedPixelLocation, False) >= 0
-
-            cv2.circle(frame, predictedPixelLocation, 5, (0, 255, 0), -1)
-
-            if move_requested:
-                print("movement requested")
-                if future_toilet_inside_bounds:
-                    print("movement sent")
-                    move_delta(delta_x, delta_y)
-                    print("movement completed")
-                    move_requested = False
-
-        # Resize the frame and thresholded image by half for display
-        frame_resized = cv2.resize(frame, (frame.shape[1] // 2, frame.shape[0] // 2))
-        thresh_resized = cv2.resize(thresh, (thresh.shape[1] // 2, thresh.shape[0] // 2))
-
-        # Display the original frame with the detected white pixels
-        cv2.imshow('Video Stream', frame_resized)
-        # Display the thresholded image
-        cv2.imshow('Thresholded Image', thresh_resized)
+        display_feed(gopro_frame, thresh)
 
         # Check if 'Q' is pressed to quit
-        if key == ord('q'):
+        if keyboard.is_pressed('q'):
             break
+
+        #necessary for cv2 graphics to update, including each frame
+        key = cv2.waitKey(1)
 finally:
     stop_threads = True
-    ser.close()  # Ensure the serial connection is closed before joining the thread
-    serial_thread.join()
+    arduino.close()  # Ensure the serial connection is closed before joining the thread
+    #serial_thread.join()
     gopro_feed.release()
     cv2.destroyAllWindows()
