@@ -19,12 +19,6 @@ class UIHandler:
         self.cursor_inside_bounds = False
         self.polygon = np.array(toilet_controller.pixel_coords, np.int32).reshape((-1, 1, 2))
         self.direction = [0,0]
-
-    def normalize_vector(x, y):
-        magnitude = math.sqrt(x**2 + y**2)
-        if magnitude == 0:
-            return 0, 0
-        return x / magnitude, y / magnitude
     
     def update_cursor_pos(self, x, y):
         self.cursor_pixel_pos[0] = x * 2
@@ -78,7 +72,7 @@ class UIHandler:
         cv2.arrowedLine(gopro_image, (render_data['toilet_pixel_x'], render_data['toilet_pixel_y']), (self.cursor_x, cursor_y), arrow_color, 2)
 
     def compute_render_data(self, gopro_image):
-        toilet_gopro_pixel_x, toilet_gopro_pixel_y, _ = self.toilet_controller.get_pixel_position(gopro_image)
+        toilet_gopro_pixel_x, toilet_gopro_pixel_y, thresh = self.toilet_controller.get_pixel_position(gopro_image)
         toilet_gopro_real_x, toilet_gopro_real_y = self.toilet_controller.pixel_to_real(toilet_gopro_pixel_x, toilet_gopro_pixel_y)
         
         toilet_real_x, toilet_real_y = self.toilet_controller.get_real_position()
@@ -92,7 +86,8 @@ class UIHandler:
             'toilet_real_x': toilet_real_x,
             'toilet_real_y': toilet_real_y,
             'toilet_pixel_x': toilet_pixel_x,
-            'toilet_pixel_y': toilet_pixel_y
+            'toilet_pixel_y': toilet_pixel_y,
+            'thresh': thresh
         }
 
         return render_data
@@ -101,15 +96,13 @@ class UIHandler:
         cv2.polylines(gopro_image, [self.polygon], isClosed=True, color=(255, 255, 0), thickness=2)
 
     def draw_ui(self, gopro_image):
-
         render_data = self.compute_render_data(gopro_image)
 
         self.render_outdated_toilet_pos(gopro_image, render_data)
         self.render_correct_toilet_pos(gopro_image, render_data)
         self.render_arrow(gopro_image, render_data)
         self.render_bounds(gopro_image)
-        self.display_feed(gopro_image, )
-        
+        self.display_feed(gopro_image, render_data['thresh'])
 
 class ToiletController:
     def __init__(self, arduino_handler):
@@ -143,10 +136,10 @@ class ToiletController:
         self.H, _ = cv2.findHomography(self.pixel_coords, self.real_coords)
         self.H_inv = np.linalg.inv(H)  # Inverse homography matrix for real world to pixel conversion
 
-    def update_velocity(self):
+    def update_velocity(self, gopro_image):
         current_time = time.time()
         time_diff = current_time - self.last_velocity_check_time
-        pixel_x, pixel_y, _ = self.get_pixel_position()
+        pixel_x, pixel_y, _ = self.get_pixel_position(gopro_image)
         if time_diff >= 0.1:
             vel_x = (pixel_x - self.last_pixel_pos[0]) / time_diff
             vel_y = (pixel_y - self.last_pixel_pos[1]) / time_diff
@@ -176,10 +169,6 @@ class ToiletController:
     def get_real_position(self):
         self.update_real_position()
         return self.real_pos[0], self.real_pos[1]
-    
-    def get_white_mask(self):
-        _, mask = self.center_of_white_pixels()
-        return self.center_of_white_pixels(self.gopro_image)
 
     def center_of_white_pixels(self,gopro_image):
         gray_image = cv2.cvtColor(gopro_image, cv2.COLOR_BGR2GRAY)
@@ -220,9 +209,8 @@ class ToiletController:
         self.arduino_handler.move(delta_x, delta_y)
 
     def is_still(self):
-        
         still_threshold = 5
-        still_duration_threshold = 0.05
+        still_duration_threshold = 0.1
 
         if self.velocity < still_threshold:
             if not self.just_stopped:
@@ -255,7 +243,7 @@ class ArduinoHandler:
         return self.pee_initial_speed
 
     def start_reading(self):
-        threading.Thread(target=self.read_loop, daemon=True).start()
+        threading.Thread(target=self.read_serial_data, daemon=True).start()
 
     def read_serial_data(self):
         while True:
@@ -297,18 +285,28 @@ try:
     gopro_feed.set(cv2.CAP_PROP_FRAME_WIDTH, gopro_feed_width)
     gopro_feed.set(cv2.CAP_PROP_FRAME_HEIGHT, gopro_feed_height)
 
+    arduino_handler = ArduinoHandler()
+    toilet_controller = ToiletController(arduino_handler)
+    ui_handler = UIHandler(toilet_controller)
+
+    ret, gopro_image = gopro_feed.read()
+
+    arduino_handler.start_reading()
+    toilet_controller.resync_position(gopro_image)
+
     while True:
-        ret, gopro_frame = gopro_feed.read()
+        ret, gopro_image = gopro_feed.read()
         if not ret:
             print("Error: Failed to capture image")
 
-        get_toilet_position(gopro_frame)
+        toilet_controller.update_velocity(gopro_image)
 
-        delta_x = cursor_real_x - toilet_real_pos[0]
-        delta_y = cursor_real_y - toilet_real_pos[1]
+        if toilet_controller.is_still():
+            toilet_controller.resync_position(gopro_image)
 
-        future_toilet_inside_bounds = [False]
-        render_text(gopro_frame, toilet_gopro_real_pos, toilet_gopro_pixel_pos, delta_x, delta_y, future_toilet_inside_bounds)
+        toilet_controller.update_real_position()
+
+        ui_handler.draw_ui(gopro_image)
 
         if move_requested:
             print("movement requested")
@@ -318,7 +316,7 @@ try:
                 print("movement completed")
                 move_requested = False
 
-        display_feed(gopro_frame, thresh)
+        display_feed(gopro_image, thresh)
 
         # Check if 'Q' is pressed to quit
         if keyboard.is_pressed('q'):
