@@ -6,82 +6,85 @@ from ctypes import c_uint8
 import serial
 import threading
 
-#Start GoPro Camera
-gopro_frame_width = 1280
-gopro_frame_height = 720
-gopro_obs_camera_index = 3 
-gopro_feed = cv2.VideoCapture(gopro_obs_camera_index, cv2.CAP_DSHOW)
-if not gopro_feed.isOpened():
-    print(f"Error: Could not open virtual camera at index {gopro_obs_camera_index}.")
-    exit()
-print(f"Successfully opened virtual camera at index {gopro_obs_camera_index}.")
-gopro_feed.set(cv2.CAP_PROP_FRAME_WIDTH, gopro_frame_width)
-gopro_feed.set(cv2.CAP_PROP_FRAME_HEIGHT, gopro_frame_height)
+class ArduinoHandler:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.serial_port = 'COM3' 
+        self.baud_rate = 2000000
+        self.serial = serial.Serial(self.serial_port, self.baud_rate)
+        self.pee_initial_speed = 0.0
 
-#Start Depth Camera
-pipeline = rs.pipeline()
-config = rs.config()
-config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
-config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-profile = pipeline.start(config)
+    def get_pee_initial_speed(self):
+        return self.pee_initial_speed
 
-#Grab Depth Camera Information
-depth_intrinsics = profile.get_stream(rs.stream.depth).as_video_stream_profile().get_intrinsics()
-fx_d, fy_d = depth_intrinsics.fx, depth_intrinsics.fy
-cx_d, cy_d = depth_intrinsics.ppx, depth_intrinsics.ppy
+    def start_reading(self):
+        threading.Thread(target=self.read_serial_data, daemon=True).start()
 
-#Match Color Pixels To Depth Pixels
-align_to = rs.stream.color
-align = rs.align(align_to)
+    def read_serial_data(self):
+        while True:
+            try:
+                # Read the serial data from Arduino
+                line = arduino.readline().decode('utf-8').strip()
+                print(f"Received line: {line}")  # Debug print to verify serial data
+                if "V:" in line:
+                    self.pee_initial_speed = float(line.split(" ")[1])
+            except Exception as e:
+                print(f"Error: {e}")
 
-origin_point_3D = None
-mode = 'detect_origin'
+class PPTracker:
+    def __init__(self, arduino_handler):
+        self.arduino_handler = arduino_handler
+        self.pee_vertical_angle_history_size = 10
+        self.pee_vertical_angle_history = deque(maxlen=self.pee_vertical_angle_history_size)
 
-# Deque to store the last few vertical angles for smoothing
-pee_vertical_angle_history_size = 10
-pee_vertical_angle_history = deque(maxlen=pee_vertical_angle_history_size)
+    def calculate_smoothed_angle(self, new_angle, angle_deque):
+        angle_deque.append(new_angle)
+        return sum(angle_deque) / len(angle_deque)
 
-#Connect To Arduino
-arduino_serial_port = 'COM3'
-arduino_baud_rate = 2000000
-arduino = serial.Serial(arduino_serial_port, arduino_baud_rate)
-pee_initial_speed = 0.0
+class DepthCameraController:
+    def __init__(self):
+        self.pipeline = rs.pipeline()
+        self.config = rs.config()
+        self.config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+        self.config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+        self.profile = None
+        self.depth_intrinsics = None
+        self.fx_d, self.fy_d = None, None
+        self.cx_d, self.cy_d = None, None
 
-def calculate_smoothed_angle(new_angle, angle_deque):
-    angle_deque.append(new_angle)
-    return sum(angle_deque) / len(angle_deque)
-
-def read_velocity():
-    global pee_initial_speed
-    while True:
-        try:
-            # Read the serial data from Arduino
-            line = arduino.readline().decode('utf-8').strip()
-            print(f"Received line: {line}")  # Debug print to verify serial data
-            if "V:" in line:
-                pee_initial_speed = float(line.split(" ")[1])
-        except Exception as e:
-            print(f"Error: {e}")
-
-# Start the thread to read velocity
-thread = threading.Thread(target=read_velocity)
-thread.daemon = True
-thread.start()
-
-try:
-    while True:
-        # Wait for a coherent pair of frames: depth and color
-        frames = pipeline.wait_for_frames()
-
+    def sync_depth_and_color_frames(self):
+        align_to = rs.stream.color
+        align = rs.align(align_to)
+        frames = self.pipeline.wait_for_frames()
         aligned_frames = align.process(frames)
+        return aligned_frames
+
+    def start_camera(self):
+        self.profile = self.pipeline.start(self.config)
+        self.depth_intrinsics = self.profile.get_stream(rs.stream.depth).as_video_stream_profile().get_intrinsics()
+        self.fx_d, self.fy_d = self.depth_intrinsics.fx, self.depth_intrinsics.fy
+        self.cx_d, self.cy_d = self.depth_intrinsics.ppx, self.depth_intrinsics.ppy
+
+    def get_frames(self):
+        aligned_frames = self.sync_depth_and_color_frames()
+
         depth_frame = aligned_frames.get_depth_frame()
         color_frame = aligned_frames.get_color_frame()
         if not depth_frame or not color_frame:
-            continue
-
-        # Convert images to numpy arrays
+            return None
         depth_image = np.asanyarray(depth_frame.get_data())
         color_image = np.asanyarray(color_frame.get_data())
+        return depth_image, color_image     
+
+try:
+    arduino_handler = ArduinoHandler()
+    arduino_handler.start_reading()
+    depth_camera_controller = DepthCameraController()
+    depth_camera_controller.start_camera()
+    origin_point_3D = None
+    mode = 'detect_origin'
+
+    while True:
 
         # Convert color image to grayscale
         gray_image = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
@@ -183,7 +186,7 @@ try:
                 cv2.putText(color_image, coord_text, (5, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
                 # Display the velocity on the frame
-                velocity_text = f"Velocity: {pee_initial_speed:.2f} m/s"
+                velocity_text = f"Velocity: {arduino_handler.get_pee_initial_speed():.2f} m/s"
                 cv2.putText(color_image, velocity_text, (5, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
                 # Draw the bottom point on the frame
