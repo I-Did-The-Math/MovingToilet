@@ -6,7 +6,6 @@ import time
 import math
 import keyboard
 
-paused = True
 real_world_height = 330
 
 class UIHandler:
@@ -28,7 +27,7 @@ class UIHandler:
     def get_real_cursor_pos(self):
         return self.toilet_controller.pixel_to_real(self.cursor_pixel_pos[0], self.cursor_pixel_pos[1])
 
-    def get_toilet_cursor_real_deltas(self)
+    def get_toilet_cursor_real_deltas(self):
         cursor_real_pos_x, cursor_real_pos_y = self.get_real_cursor_pos()
         toilet_real_pos_x, toilet_real_pos_y = self.toilet_controller.get_real_pos()
         cursor_real_delta_x = toilet_real_pos_x - cursor_real_pos_x
@@ -46,7 +45,7 @@ class UIHandler:
         if event == cv2.EVENT_LBUTTONDOWN:  
             self.move_toilet_to_mouse()
 
-    def display_feed(frame, thresh):
+    def display_feed(self, frame, thresh):
         frame_resized = cv2.resize(frame, (frame.shape[1] // 2, frame.shape[0] // 2))
         thresh_resized = cv2.resize(thresh, (thresh.shape[1] // 2, thresh.shape[0] // 2))
 
@@ -69,7 +68,7 @@ class UIHandler:
         arrow_color = (255, 0 , 0) if self.cursor_inside_bounds else (0, 0, 255)
         cursor_x = self.cursor_pixel_pos[0]
         cursor_y = self.cursor_pixel_pos[1]
-        cv2.arrowedLine(gopro_image, (render_data['toilet_pixel_x'], render_data['toilet_pixel_y']), (self.cursor_x, cursor_y), arrow_color, 2)
+        cv2.arrowedLine(gopro_image, (render_data['toilet_pixel_x'], render_data['toilet_pixel_y']), (cursor_x, cursor_y), arrow_color, 2)
 
     def compute_render_data(self, gopro_image):
         toilet_gopro_pixel_x, toilet_gopro_pixel_y, thresh = self.toilet_controller.get_pixel_position(gopro_image)
@@ -134,7 +133,7 @@ class ToiletController:
         ])
 
         self.H, _ = cv2.findHomography(self.pixel_coords, self.real_coords)
-        self.H_inv = np.linalg.inv(H)  # Inverse homography matrix for real world to pixel conversion
+        self.H_inv = np.linalg.inv(self.H)  # Inverse homography matrix for real world to pixel conversion
 
     def update_velocity(self, gopro_image):
         current_time = time.time()
@@ -271,7 +270,6 @@ class ArduinoHandler:
             print(f"Sent: {command}")
 
 try:
-    #Connect To GoPro
     obs_virtual_camera_index = 3 
     gopro_feed = cv2.VideoCapture(obs_virtual_camera_index, cv2.CAP_DSHOW)
     if not gopro_feed.isOpened():
@@ -279,7 +277,6 @@ try:
         exit()
     print(f"Successfully opened virtual camera at index {obs_virtual_camera_index}.")
 
-    #Setup GoPro Feed Window
     gopro_feed_width = 1280
     gopro_feed_height = 720
     gopro_feed.set(cv2.CAP_PROP_FRAME_WIDTH, gopro_feed_width)
@@ -308,25 +305,12 @@ try:
 
         ui_handler.draw_ui(gopro_image)
 
-        if move_requested:
-            print("movement requested")
-            if future_toilet_inside_bounds[0]:
-                print("movement sent")
-                move_delta(delta_x, delta_y)
-                print("movement completed")
-                move_requested = False
-
-        display_feed(gopro_image, thresh)
-
-        # Check if 'Q' is pressed to quit
         if keyboard.is_pressed('q'):
             break
 
         #necessary for cv2 graphics to update, including each frame
         key = cv2.waitKey(1)
+        print('one loop wassup')
 finally:
-    stop_threads = True
-    arduino.close()  # Ensure the serial connection is closed before joining the thread
-    #serial_thread.join()
     gopro_feed.release()
     cv2.destroyAllWindows()
