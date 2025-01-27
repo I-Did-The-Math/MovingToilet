@@ -256,6 +256,10 @@ class PPTracker:
         return None
     
     def calculate_pp_diff_positions(self, white_pixel_centers, depth_data):
+        if len(white_pixel_centers) != 2:
+            print("incorrect number of centers")
+            return
+
         if self.get_pixel_positions(white_pixel_centers) == None:
             return
         
