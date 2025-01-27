@@ -96,7 +96,7 @@ try:
         _, thresh = cv2.threshold(masked_gray_image, 252, 255, cv2.THRESH_BINARY)
         
         # Clean up
-        kernel_size = 5
+        kernel_size = 7
         kernel = np.ones((kernel_size, kernel_size), c_uint8)
         thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
 

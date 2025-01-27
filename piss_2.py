@@ -22,75 +22,57 @@ class ArduinoHandler:
 
     def read_serial_data(self):
         while True:
-            try:
-                # Read the serial data from Arduino
-                line = arduino.readline().decode('utf-8').strip()
-                print(f"Received line: {line}")  # Debug print to verify serial data
-                if "V:" in line:
-                    self.pee_initial_speed = float(line.split(" ")[1])
-            except Exception as e:
-                print(f"Error: {e}")
+            with self.lock:
+                if self.serial.in_waiting > 0:
+                    line = self.serial.readline().decode('utf-8').strip()
+                    if "X," in line:
+                        parts = line.split(",")
+                        self.delta_x = float(parts[1]) * 0.9
+                        self.delta_y = float(parts[3])
+
+                    if "V:" in line:
+                        self.pee_initial_speed = float(line.split(" ")[1])
 
 class PPTracker:
-    def __init__(self, arduino_handler):
+    def __init__(self, arduino_handler, depth_camera_controller):
         self.arduino_handler = arduino_handler
         self.pee_vertical_angle_history_size = 10
         self.pee_vertical_angle_history = deque(maxlen=self.pee_vertical_angle_history_size)
+        self.depth_camera_controller = depth_camera_controller
+        self.origin = None
+        self.pp_diff_tip = None
+        self.pp_diff_bottom = None
+        self.vertical_angle = None
+        self.horizontal_angle = None
 
-    def calculate_smoothed_angle(self, new_angle, angle_deque):
-        angle_deque.append(new_angle)
-        return sum(angle_deque) / len(angle_deque)
-
-class DepthCameraController:
-    def __init__(self):
-        self.pipeline = rs.pipeline()
-        self.config = rs.config()
-        self.config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
-        self.config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-        self.profile = None
-        self.depth_intrinsics = None
-        self.fx_d, self.fy_d = None, None
-        self.cx_d, self.cy_d = None, None
-
-    def sync_depth_and_color_frames(self):
-        align_to = rs.stream.color
-        align = rs.align(align_to)
-        frames = self.pipeline.wait_for_frames()
-        aligned_frames = align.process(frames)
-        return aligned_frames
-
-    def start_camera(self):
-        self.profile = self.pipeline.start(self.config)
-        self.depth_intrinsics = self.profile.get_stream(rs.stream.depth).as_video_stream_profile().get_intrinsics()
-        self.fx_d, self.fy_d = self.depth_intrinsics.fx, self.depth_intrinsics.fy
-        self.cx_d, self.cy_d = self.depth_intrinsics.ppx, self.depth_intrinsics.ppy
-
-    def get_frames(self):
-        aligned_frames = self.sync_depth_and_color_frames()
-
-        depth_frame = aligned_frames.get_depth_frame()
-        color_frame = aligned_frames.get_color_frame()
-        if not depth_frame or not color_frame:
+    def get_diff_tip_position(self):
+        return self.pp_diff_tip
+    
+    def get_pixel_positions(self, white_pixel_centers):
+        if len(white_pixel_centers) < 2:
             return None
-        depth_image = np.asanyarray(depth_frame.get_data())
-        color_image = np.asanyarray(color_frame.get_data())
-        return depth_image, color_image     
+        
+        white_pixel_centers.sort(key=lambda x: x[1])
 
-try:
-    arduino_handler = ArduinoHandler()
-    arduino_handler.start_reading()
-    depth_camera_controller = DepthCameraController()
-    depth_camera_controller.start_camera()
-    origin_point_3D = None
-    mode = 'detect_origin'
+        pp_pixel_bottom = white_pixel_centers[0]  # Assume the second centroid is the bottom point
+        pp_pixel_tip = white_pixel_centers[1]  # Assume the first centroid is the to` p point
 
-    while True:
+        return pp_pixel_bottom, pp_pixel_tip
+    
+    def get_pixel_tip_position(self, white_pixel_centers):
+        _ , pp_pixel_tip = self.get_pixel_positions(white_pixel_centers)
+        return pp_pixel_tip
 
+    def get_smoothed_vertical_angle(self, latest_vertical_angle):
+        self.pee_vertical_angle_history.append(latest_vertical_angle)
+        return sum(self.pee_vertical_angle_history) / len(self.pee_vertical_angle_history)
+    
+    def get_white_pixels(self, color_image):
         # Convert color image to grayscale
         gray_image = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
 
         # Mask the bottom half of the image
-        height, width = gray_image.shape
+        height, _ = gray_image.shape
         mask = np.zeros_like(gray_image)
         mask[:height // 2, :] = 255
         masked_gray_image = cv2.bitwise_and(gray_image, mask)
@@ -102,106 +84,204 @@ try:
         kernel_size = 5
         kernel = np.ones((kernel_size, kernel_size), c_uint8)
         thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+        return thresh
 
-        # Find contours and their centroids
+    def get_centers_of_white_pixels(self, thresh):
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         centroids = [cv2.moments(contour) for contour in contours if cv2.moments(contour)['m00'] != 0]
         centroids = [(int(m['m10']/m['m00']), int(m['m01']/m['m00'])) for m in centroids]
+        return centroids
+    
+    def pixel_to_real_position(self, pixel_x, pixel_y, depth_data):
+        real_z = depth_data.get_distance(pixel_x, pixel_y)
+        if real_z > 0:  # Avoid division by zero and invalid depth values
+            real_x = (pixel_x - depth_camera_controller.cx_d) *  real_z / depth_camera_controller.fx_d
+            real_y = (pixel_y - depth_camera_controller.cy_d) *  real_z / depth_camera_controller.fy_d
+            real_position = (real_x, real_y, real_z)
+            return real_position
+        return None
+    
+    
+    def calculate_pp_diff_positions(self, white_pixel_centers, depth_data):
+        if self.get_pixel_positions(white_pixel_centers) == None:
+            return
+        
+        pp_pixel_bottom, pp_pixel_tip = self.get_pixel_positions(white_pixel_centers)
 
-        if mode == 'detect_origin':
-            # Ensure there is exactly one bright spot
-            if len(centroids) == 1:
-                x_c, y_c = centroids[0]
-                z = depth_frame.get_distance(x_c, y_c)
-                if z > 0:  # Avoid division by zero and invalid depth values
-                    origin_x = (x_c - cx_d) * z / fx_d
-                    origin_y = (y_c - cy_d) * z / fy_d
-                    origin_point_3D = (origin_x, origin_y, z)
-                    print(f"Origin point detected at: {origin_point_3D}")
+        self.pp_diff_tip = self.pixel_to_diff(pp_pixel_tip[0], pp_pixel_tip[1], depth_data)
+        self.pp_diff_bottom = self.pixel_to_diff(pp_pixel_bottom[0], pp_pixel_bottom[1], depth_data)
 
-            cv2.putText(color_image, "Press 'o' to set origin point", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-            
-            # Check for key press to switch mode
-            if cv2.waitKey(1) & 0xFF == ord('o'):
-                if origin_point_3D is not None:
-                    mode = 'track_targets'
+    def diff_from_origin(self, real_x, real_y, real_z):
+        diff_x = real_x - self.origin[0]
+        diff_y = real_y - self.origin[1]
+        diff_z = real_z - self.origin[2]  # Keep the Z coordinate positive
+        if diff_z < 0:  # Ensure positive Z value
+            diff_z = -diff_z
+        return (diff_x, diff_y, diff_z)
+    
+    def pixel_to_diff(self, pixel_x, pixel_y, depth_data):
+        if self.pixel_to_real_position(pixel_x, pixel_y, depth_data):
+            real_x, real_y, real_z = self.pixel_to_real_position(pixel_x, pixel_y, depth_data)
+            return self.diff_from_origin(real_x, real_y, real_z)
+        return None
+    
+    def calculate_pp_orientation(self):
 
-        elif mode == 'track_targets':
-            # Ensure we have exactly two bright spots (assuming they correspond to the retroreflective tape on the bottle)
-            if len(centroids) < 2:
-                continue
+        if self.pp_diff_tip and self.pp_diff_bottom:
 
-            # Sort centroids by Y coordinate to identify the bottom point
-            centroids.sort(key=lambda x: x[1])
-            bottom_centroid = centroids[1]  # Assume the second centroid is the bottom point
-            top_centroid = centroids[0]  # Assume the first centroid is the to` p point
+            pp_orientation = np.array(self.pp_diff_tip) - np.array(self.pp_diff_bottom)
+            diff_x = pp_orientation[0]
+            diff_y = pp_orientation[1]
+            diff_z = pp_orientation[2]
 
-            # Calculate 3D coordinates for the bottom centroid relative to the origin point
-            x_c, y_c = bottom_centroid
-            z = depth_frame.get_distance(x_c, y_c)
-            if z > 0:  # Avoid division by zero and invalid depth values
-                x = (x_c - cx_d) * z / fx_d
-                y = (y_c - cy_d) * z / fy_d
-                relative_x = x - origin_point_3D[0]
-                relative_y = y - origin_point_3D[1]
-                relative_z = z - origin_point_3D[2]  # Keep the Z coordinate positive
-                if relative_z < 0:  # Ensure positive Z value
-                    relative_z = -relative_z
-                bottle_tip_real_coords = (relative_x, relative_y, relative_z)
+            # Calculate the angles
+            raw_vertical_angle = np.degrees(np.arctan2(diff_z, np.sqrt(diff_x**2 + diff_y**2)))
 
-                # Calculate 3D coordinates for the top centroid relative to the origin point
-                x_c_top, y_c_top = top_centroid
-                z_top = depth_frame.get_distance(x_c_top, y_c_top)
-                if z_top > 0:  # Avoid division by zero and invalid depth values
-                    x_top = (x_c_top - cx_d) * z_top / fx_d
-                    y_top = (y_c_top - cy_d) * z_top / fy_d
-                    relative_x_top = x_top - origin_point_3D[0]
-                    relative_y_top = y_top - origin_point_3D[1]
-                    relative_z_top = z_top - origin_point_3D[2]
-                    if relative_z_top < 0:  # Ensure positive Z value
-                        relative_z_top = -relative_z_top
-                    bottle_mid_real_coords = (relative_x_top, relative_y_top, relative_z_top)
+            self.horizontal_angle = np.degrees(np.arctan2(diff_y,diff_x))
+            self.vertical_angle = self.get_smoothed_vertical_angle(raw_vertical_angle)
 
-                    # Calculate the differences to get the orientation
-                    diff_x = bottle_tip_real_coords[0] - bottle_mid_real_coords[0]
-                    diff_y = bottle_tip_real_coords[1] - bottle_mid_real_coords[1]
-                    diff_z = bottle_tip_real_coords[2] - bottle_mid_real_coords[2]
+    def set_origin(self, real_x, real_y, real_z):
+        self.origin = (real_x, real_y, real_z)
 
-                    # Calculate the angles
-                    vertical_angle = np.degrees(np.arctan2(diff_z, np.sqrt(diff_x**2 + diff_y**2)))
-                    horizontal_angle = np.degrees(np.arctan2(diff_y,diff_x))
-
-                    # Smooth the vertical angle using moving average
-                    smoothed_vertical_angle = calculate_smoothed_angle(vertical_angle, pee_vertical_angle_history)
-
-                    # Display the angles on the frame
-                    angle_text = f"Vertical Angle: {smoothed_vertical_angle:.2f} deg\nHorizontal Angle: {horizontal_angle:.2f} deg"
-                    y0, dy = 15, 15
-                    for i, line in enumerate(angle_text.split('\n')):
-                        y = y0 + i*dy 
-                        cv2.putText(color_image, line, (5, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
-                # Display the 3D coordinates on the frame
-                coord_text = f"Bottle Tip: ({bottle_tip_real_coords[0]:.2f}, {bottle_tip_real_coords[1]:.2f}, {bottle_tip_real_coords[2]:.2f})"
-                cv2.putText(color_image, coord_text, (5, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
-                # Display the velocity on the frame
-                velocity_text = f"Velocity: {arduino_handler.get_pee_initial_speed():.2f} m/s"
-                cv2.putText(color_image, velocity_text, (5, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
-                # Draw the bottom point on the frame
-                cv2.circle(color_image, bottom_centroid, 5, (0, 255, 0), -1)
+    def angle_text(self):
+        if self.vertical_angle == None or self.horizontal_angle == None:
+            return f"Vertical Angle: N/A deg\nHorizontal Angle: N/A deg"
+        return f"Vertical Angle: {self.vertical_angle:.2f} deg\nHorizontal Angle: {self.horizontal_angle:.2f} deg"
+    
+    def coord_text(self):
+        if self.pp_diff_tip == None:
+            return f"Bottle Tip: (N/A, N/A, N/A)"
+        return f"Bottle Tip: ({self.pp_diff_tip[0]:.2f}, {self.pp_diff_tip[1]:.2f}, {self.pp_diff_tip[2]:.2f})"
+    
+    def get_initial_speed(self):
+        return self.arduino_handler.get_pee_initial_speed()
+    
+    def velocity_text(self):
+        return f"Velocity: {self.get_initial_speed():.2f} m/s"
 
 
-        # Show the current processed images
+class DepthCameraController:
+    def __init__(self):
+        self.pipeline = rs.pipeline()
+        self.config = rs.config()
+        self.config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+        self.config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+        self.profile = None
+        self.depth_intrinsics = None
+        self.fx_d, self.fy_d = None, None
+        self.cx_d, self.cy_d = None, None
+        self.align_to = rs.stream.color
+        self.align = rs.align(self.align_to)
+    
+    def set_intrinsics(self):
+        self.depth_intrinsics = self.profile.get_stream(rs.stream.depth).as_video_stream_profile().get_intrinsics()
+        self.fx_d, self.fy_d = self.depth_intrinsics.fx, self.depth_intrinsics.fy
+        self.cx_d, self.cy_d = self.depth_intrinsics.ppx, self.depth_intrinsics.ppy
+
+    def start_camera(self):
+        self.profile = self.pipeline.start(self.config)
+        self.set_intrinsics()
+
+    def get_depth_and_color_frames(self):
+        frames = self.pipeline.wait_for_frames()
+        aligned_frames = self.align.process(frames)
+
+        depth_data = aligned_frames.get_depth_frame()
+        color_frame = aligned_frames.get_color_frame()
+        if not depth_data or not color_frame:
+            return None
+        depth_image = np.asanyarray(depth_data.get_data())
+        color_image = np.asanyarray(color_frame.get_data())
+        return depth_data, depth_image, color_image
+    
+class ModeTracker:
+    def __init__(self):
+        self.mode_list = ['origin', 'track']
+        self.mode = self.mode_list[0]
+
+    def set_to_origin(self):
+        self.mode = self.mode_list[0]
+
+    def set_to_track(self):
+        self.mode = self.mode_list[1]
+    
+    def is_tracking(self):
+        return self.mode == self.mode_list[1]
+    
+class UIHandler:
+    def __init__(self, pp_tracker, mode_tracker):
+        self.pp_tracker = pp_tracker
+        self.mode_tracker = mode_tracker
+        cv2.namedWindow('Human Vision')
+        cv2.namedWindow('Reflective Tape')
+
+
+    def display_feed(self, color_image, thresh):
         cv2.imshow('Human Vision', color_image)
         cv2.imshow('Reflective Tape', thresh)
+    
+    def draw_origin_text(self, color_image):
+        cv2.putText(color_image, "Valid origin! Press 'o' to set origin point", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+    
+    def draw_invalid_origin_text(self, color_image, count):
+        cv2.putText(color_image, f'Invalid number of points detected: {count}', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
 
-        # Break the loop on 'q' key press
+    def draw_tracking_ui(self, color_image, white_pixel_centers):
+
+        angle_text = self.pp_tracker.angle_text()
+        y0, dy = 15, 15
+        for i, line in enumerate(angle_text.split('\n')):
+            y = y0 + i*dy 
+            cv2.putText(color_image, line, (5, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+        # Display the 3D coordinates on the frame
+        coord_text = self.pp_tracker.coord_text()
+        cv2.putText(color_image, coord_text, (5, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+        # Display the velocity on the frame
+        velocity_text = self.pp_tracker.velocity_text()
+        cv2.putText(color_image, velocity_text, (5, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+        if self.pp_tracker.pp_diff_tip and self.pp_tracker.pp_diff_bottom:
+            cv2.circle(color_image, self.pp_tracker.get_pixel_tip_position(white_pixel_centers), 5, (0, 255, 0), -1)
+
+
+try:
+    arduino_handler = ArduinoHandler()
+    arduino_handler.start_reading()
+    depth_camera_controller = DepthCameraController()
+    depth_camera_controller.start_camera()
+    pp_tracker = PPTracker(arduino_handler, depth_camera_controller)
+    mode_tracker = ModeTracker()
+    ui_handler = UIHandler(pp_tracker, mode_tracker)
+
+    while True:
+        depth_data, depth_image, color_image = depth_camera_controller.get_depth_and_color_frames()
+        white_pixels = pp_tracker.get_white_pixels(color_image)
+        white_pixel_centers = pp_tracker.get_centers_of_white_pixels(white_pixels)
+        white_pixel_center_count = len(white_pixel_centers)
+
+        if not mode_tracker.is_tracking():
+            if white_pixel_center_count == 1:
+                origin_pixel_x, origin_pixel_y = white_pixel_centers[0]
+                origin_point = pp_tracker.pixel_to_real_position(origin_pixel_x, origin_pixel_y, depth_data)
+
+                ui_handler.draw_origin_text(color_image)
+
+                if cv2.waitKey(1) & 0xFF == ord('o'):
+                        pp_tracker.set_origin(origin_point[0], origin_point[1], origin_point[2])
+                        mode_tracker.set_to_track()
+            else:
+                ui_handler.draw_invalid_origin_text(color_image, white_pixel_center_count)
+
+        elif white_pixel_center_count == 2:
+            pp_tracker.calculate_pp_diff_positions(white_pixel_centers, depth_data)
+            pp_tracker.calculate_pp_orientation()
+            ui_handler.draw_tracking_ui(color_image, white_pixel_centers)
+
+        ui_handler.display_feed(color_image, white_pixels)
+
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 finally:
-    # Stop streaming and close all resources
-    pipeline.stop()
     cv2.destroyAllWindows()
-    arduino.close()
