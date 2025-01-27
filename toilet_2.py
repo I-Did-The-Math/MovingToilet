@@ -314,8 +314,6 @@ try:
             #print("toilet is moving")
             recently_stopped = False
 
-        #toilet_controller.update_real_position()
-
         ui_handler.draw_ui(gopro_image)
 
         if keyboard.is_pressed('q'):
