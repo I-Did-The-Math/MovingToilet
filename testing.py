@@ -29,15 +29,15 @@ class UIHandler:
 
     def get_toilet_cursor_real_deltas(self):
         cursor_real_pos_x, cursor_real_pos_y = self.get_real_cursor_pos()
-        toilet_real_pos_x, toilet_real_pos_y = self.toilet_controller.get_real_position()
-        cursor_real_delta_x = cursor_real_pos_x - toilet_real_pos_x
-        cursor_real_delta_y = cursor_real_pos_y - toilet_real_pos_y
+        toilet_real_pos_x, toilet_real_pos_y = self.toilet_controller.get_real_pos()
+        cursor_real_delta_x = toilet_real_pos_x - cursor_real_pos_x
+        cursor_real_delta_y = toilet_real_pos_y - cursor_real_pos_y
         return cursor_real_delta_x, cursor_real_delta_y
     
     def move_toilet_to_mouse(self):
         cursor_real_delta_x, cursor_real_delta_y = self.get_toilet_cursor_real_deltas()
         if self.cursor_inside_bounds:
-            self.toilet_controller.move_relative(cursor_real_delta_x, cursor_real_delta_y)    
+            self.toilet_controller.move(cursor_real_delta_x, cursor_real_delta_y)    
 
     def mouse_callback(self, event, x, y, flags, param):
         if event == cv2.EVENT_MOUSEMOVE:
@@ -133,7 +133,7 @@ class ToiletController:
         ])
 
         self.H, _ = cv2.findHomography(self.pixel_coords, self.real_coords)
-        self.H_inv = np.linalg.inv(self.H)  #Inverse homography matrix for real world to pixel conversion
+        self.H_inv = np.linalg.inv(self.H)  # Inverse homography matrix for real world to pixel conversion
 
     def update_velocity(self, gopro_image):
         current_time = time.time()
@@ -150,7 +150,6 @@ class ToiletController:
             self.last_velocity_check_time = current_time
 
     def resync_position(self, gopro_image):
-        print('synced position')
         self.set_initial_position(gopro_image)
         self.arduino_handler.reset_encoders()
         self.update_real_position()
@@ -163,7 +162,6 @@ class ToiletController:
 
     def update_real_position(self):
         delta_x, delta_y = self.arduino_handler.get_deltas()
-        #print (delta_x)
         self.real_pos[0] = self.init_pos[0] + delta_x
         self.real_pos[1] = self.init_pos[1] + delta_y
 
@@ -210,7 +208,7 @@ class ToiletController:
         self.arduino_handler.move(delta_x, delta_y)
 
     def is_still(self):
-        still_threshold = 15
+        still_threshold = 5
         still_duration_threshold = 0.1
 
         if self.velocity < still_threshold:
@@ -248,26 +246,23 @@ class ArduinoHandler:
 
     def read_serial_data(self):
         while True:
+            
             with self.lock:
-                #print("holding lock from serial")
-                if self.serial.in_waiting > 0:
-                    line = self.serial.readline().decode('utf-8').strip()
-                    #print(f"Received line: {line}")
-                    if "X," in line:
-                        parts = line.split(",")
-                        self.delta_x = float(parts[1]) * 0.9
-                        self.delta_y = float(parts[3])
-
-                    if "V:" in line:
-                        self.pee_initial_speed = float(line.split(" ")[1])
+                line = self.serial.readline().decode('utf-8').strip()
+                print(f"Received line: {line}")
+            #    if "X," in line:
+            #        parts = line.split(",")
+            #        self.delta_x = float(parts[1]) * 0.9
+            #        self.delta_y = float(parts[3])
+#
+             #   if "V:" in line:
+            #        self.pee_initial_speed = float(line.split(" ")[1])
                     
     def reset_encoders(self):
         with self.lock:
             self.serial.write(b"RESET_ENCODERS\n")
             print("Encoders Set To Zero")
             time.sleep(0.1)
-            self.delta_x = 0
-            self.delta_y = 0
 
     def move(self,delta_x, delta_y):
         with self.lock:
@@ -296,23 +291,16 @@ try:
 
     arduino_handler.start_reading()
     toilet_controller.resync_position(gopro_image)
-    recently_stopped = False
 
     while True:
         ret, gopro_image = gopro_feed.read()
-        if not ret:
-            print("Error: Failed to capture image")
+        #if not ret:
+        #    print("Error: Failed to capture image")
 
-        toilet_controller.update_velocity(gopro_image)
+        #toilet_controller.update_velocity(gopro_image)
 
-        if toilet_controller.is_still():
-            if not recently_stopped:
-                print("toilet just stopped")
-                toilet_controller.resync_position(gopro_image)
-                recently_stopped = True
-        else:
-            #print("toilet is moving")
-            recently_stopped = False
+        #if toilet_controller.is_still():
+        #    toilet_controller.resync_position(gopro_image)
 
         #toilet_controller.update_real_position()
 
@@ -323,7 +311,6 @@ try:
 
         #necessary for cv2 graphics to update, including each frame
         key = cv2.waitKey(1)
-        #print('one loop wassup')
 finally:
     gopro_feed.release()
     cv2.destroyAllWindows()
