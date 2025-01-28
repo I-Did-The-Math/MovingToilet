@@ -23,18 +23,18 @@ class ToiletController:
 
         # Coordinates in mm
         self.real_coords = np.array([
-            [180, 260],
-            [795, 260],
-            [795, 880],
-            [180, 880]
+            [690, 840],
+            [250, 840],
+            [250, 360],
+            [690, 360]
         ])
 
         # Coordinates in pixels
         self.pixel_coords = np.array([
-            [420, 97],
-            [848, 92],
-            [848, 498],
-            [423, 502]
+            [795, 492],
+            [505, 492],
+            [492, 141],
+            [798, 142]
         ])
 
         self.H, _ = cv2.findHomography(self.pixel_coords, self.real_coords)
@@ -235,7 +235,7 @@ class PPTracker:
         _, thresh = cv2.threshold(masked_gray_image, 252, 255, cv2.THRESH_BINARY)
         
         # Clean up
-        kernel_size = 5
+        kernel_size = 7
         kernel = np.ones((kernel_size, kernel_size), c_uint8)
         thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
         return thresh
@@ -245,9 +245,34 @@ class PPTracker:
         centroids = [cv2.moments(contour) for contour in contours if cv2.moments(contour)['m00'] != 0]
         centroids = [(int(m['m10']/m['m00']), int(m['m01']/m['m00'])) for m in centroids]
         return centroids
+
+    def get_depth_of_pixel(self, pixel_x, pixel_y, depth_data):
+        return depth_data.get_distance(pixel_x, pixel_y)
+    
+    def real_to_pixel_position(self, diff_x, diff_y, diff_z):
+        if self.origin is None:
+            print("Error: Origin is not set. Cannot convert real-world coordinates to pixel coordinates.")
+            return None
+
+        # Add the origin back to get the real-world coordinates
+        real_x = diff_x + self.origin[0]
+        real_y = diff_y + self.origin[1]
+        real_z = diff_z + self.origin[2]
+
+        # Check if the depth (z) is valid
+        if real_z <= 0:
+            print(f"Invalid depth (real_z): {real_z}. Cannot compute pixel coordinates.")
+            return None
+
+        # Convert real-world coordinates to pixel coordinates using camera intrinsics
+        pixel_x = int((real_x * self.depth_camera_controller.fx_d) / real_z + self.depth_camera_controller.cx_d)
+        pixel_y = int((real_y * self.depth_camera_controller.fy_d) / real_z + self.depth_camera_controller.cy_d)
+
+        return pixel_x, pixel_y
     
     def pixel_to_real_position(self, pixel_x, pixel_y, depth_data):
-        real_z = depth_data.get_distance(pixel_x, pixel_y)
+        real_z = self.get_depth_of_pixel(pixel_x, pixel_y, depth_data)
+
         if real_z > 0:  # Avoid division by zero and invalid depth values
             real_x = (pixel_x - depth_camera_controller.cx_d) *  real_z / depth_camera_controller.fx_d
             real_y = (pixel_y - depth_camera_controller.cy_d) *  real_z / depth_camera_controller.fy_d
@@ -256,14 +281,9 @@ class PPTracker:
         return None
     
     def calculate_pp_diff_positions(self, white_pixel_centers, depth_data):
-        if len(white_pixel_centers) != 2:
-            print("incorrect number of centers")
-            return
-
-        if self.get_pixel_positions(white_pixel_centers) == None:
-            return
         
         pp_pixel_bottom, pp_pixel_tip = self.get_pixel_positions(white_pixel_centers)
+
 
         self.pp_diff_tip = self.pixel_to_diff(pp_pixel_tip[0], pp_pixel_tip[1], depth_data)
         self.pp_diff_bottom = self.pixel_to_diff(pp_pixel_bottom[0], pp_pixel_bottom[1], depth_data)
@@ -311,7 +331,7 @@ class PPTracker:
         return f"Bottle Tip: ({self.pp_diff_tip[0]:.2f}m, {self.pp_diff_tip[1]:.2f}m, {self.pp_diff_tip[2]:.2f}m)"
     
     def get_initial_speed(self):
-        return self.arduino_handler.get_pee_initial_speed()
+        return self.arduino_handler.get_pee_initial_speed() * 0.2
     
     def velocity_text(self):
         return f"Velocity: {self.get_initial_speed():.2f} m/s"
@@ -344,8 +364,8 @@ class PPTracker:
         landing_time = current_time + elapsed_time
 
         # Calculate landing position
-        x_land = diff_x + v_x * elapsed_time
-        y_land = diff_y + v_y * elapsed_time
+        x_land = diff_x - v_x * elapsed_time
+        y_land = diff_y - v_y * elapsed_time
 
         # Return the landing position and time
         return x_land, y_land, self.toilet_height_m, landing_time
@@ -480,12 +500,14 @@ class UIHandler:
 
     def render_outdated_toilet_pos(self, gopro_image, render_data):
         cv2.circle(gopro_image, (render_data['toilet_gopro_pixel_x'], render_data['toilet_gopro_pixel_y']), 5, (0, 255, 0), -1)
-        text_camera = f"Outdated Position: ({render_data['toilet_gopro_real_x']:.2f} m, {render_data['toilet_gopro_real_y']:.2f} m)"
-        cv2.putText(gopro_image, text_camera, (render_data['toilet_gopro_pixel_x'] + 20, render_data['toilet_gopro_pixel_y'] + 10), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 4)
+        text_camera = f"Outdated Position: ({render_data['toilet_gopro_real_x']:.2f} mm, {render_data['toilet_gopro_real_y']:.2f} mm)"
+        cv2.putText(gopro_image, text_camera, (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 4)
+        text_camera_pixel = f"Pixel Position: ({render_data['toilet_gopro_pixel_x']:.2f} px, {render_data['toilet_gopro_pixel_y']:.2f} px)"
+        cv2.putText(gopro_image, text_camera_pixel, (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 4)
     
     def render_correct_toilet_pos(self, gopro_image, render_data):
         cv2.circle(gopro_image, (render_data['toilet_pixel_x'], render_data['toilet_pixel_y']), 5, (255, 0, 0), -1)
-        text_real = f"Toilet In Real Life: ({render_data['toilet_real_x']:.2f} m, {render_data['toilet_real_y']:.2f} m)"
+        text_real = f"Toilet In Real Life: ({render_data['toilet_real_x']:.2f} mm, {render_data['toilet_real_y']:.2f} mm)"
         cv2.putText(gopro_image, text_real, (render_data['toilet_pixel_x'] + 20, render_data['toilet_pixel_y'] - 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 4)
 
     def render_arrow(self, gopro_image, render_data):
@@ -494,7 +516,7 @@ class UIHandler:
         cursor_y = self.cursor_pixel_pos[1]
         cv2.arrowedLine(gopro_image, (render_data['toilet_pixel_x'], render_data['toilet_pixel_y']), (cursor_x, cursor_y), arrow_color, 2)
 
-    def compute_toilet_render_data(self, gopro_image, landing_real_x, landing_real_y):
+    def compute_toilet_render_data(self, gopro_image, landing_real_x, landing_real_y, landing_real_z):
         toilet_gopro_pixel_x, toilet_gopro_pixel_y, thresh = self.toilet_controller.get_pixel_position(gopro_image)
         toilet_gopro_real_x, toilet_gopro_real_y = self.toilet_controller.pixel_to_real(toilet_gopro_pixel_x, toilet_gopro_pixel_y)
         
@@ -504,7 +526,11 @@ class UIHandler:
         if landing_real_x == None or landing_real_y == None:
             landing_pixel_x, landing_pixel_y = None, None
         else:
+            #ensure landing_real units are in mm
+            landing_real_x *= 1000
+            landing_real_y *= 1000
             landing_pixel_x, landing_pixel_y = self.toilet_controller.real_to_pixel(landing_real_x, landing_real_y)
+            print(f'{landing_pixel_x} {landing_pixel_y}')
 
         render_data = {
             'toilet_gopro_pixel_x': toilet_gopro_pixel_x,
@@ -535,8 +561,8 @@ class UIHandler:
         text_real = f"Predicted Landing Pos: ({render_data['landing_real_x']:.2f} m, {render_data['landing_real_y']:.2f} m at )"
         cv2.putText(gopro_image, text_real, (render_data['landing_pixel_x'] + 20, render_data['landing_pixel_y'] - 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 4)
 
-    def draw_toilet_ui(self, gopro_image, landing_real_x, landing_real_y):
-        render_data = self.compute_toilet_render_data(gopro_image, landing_real_x, landing_real_y)
+    def draw_toilet_ui(self, gopro_image, landing_real_x, landing_real_y, landing_real_z):
+        render_data = self.compute_toilet_render_data(gopro_image, landing_real_x, landing_real_y, landing_real_z)
 
         self.render_outdated_toilet_pos(gopro_image, render_data)
         self.render_correct_toilet_pos(gopro_image, render_data)
@@ -600,12 +626,19 @@ try:
                 ui_handler.draw_invalid_origin_text(color_image, white_pixel_center_count)
 
         elif white_pixel_center_count == 2:
+            
             pp_tracker.calculate_pp_diff_positions(white_pixel_centers, depth_data)
+            if pp_tracker.get_diff_tip_position() == None:
+                print("Skipping frame: Unable to compute diff_tip_position.")
+                continue
             pp_tracker.calculate_pp_orientation()
             pp_diff_x, pp_diff_y, pp_diff_z = pp_tracker.get_diff_tip_position()
             pp_initial_speed = pp_tracker.get_initial_speed()
             pp_vertical_angle = pp_tracker.get_vertical_angle()
             pp_horizontal_angle = pp_tracker.get_horizontal_angle()
+            if pp_vertical_angle == None:
+                print("vertical angle not real number, skipping")
+                continue
 
             landing_x, landing_y, landing_z, landing_time = pp_tracker.calculate_landing_location_at_toilet_height(pp_diff_x, pp_diff_y, pp_diff_z, pp_initial_speed, pp_horizontal_angle, pp_vertical_angle)
 
@@ -629,7 +662,7 @@ try:
             recently_stopped = False
 
 
-        ui_handler.draw_toilet_ui(gopro_image, landing_x, landing_y)
+        ui_handler.draw_toilet_ui(gopro_image, landing_x, landing_y, landing_z)
 
         #quit button / render cv2
         if cv2.waitKey(1) & 0xFF == ord('q'):
