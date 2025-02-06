@@ -68,7 +68,6 @@ class ToiletController:
 
     def update_real_position(self):
         delta_x, delta_y = self.arduino_handler.get_deltas()
-        #print (delta_x)
         self.real_pos[0] = self.init_pos[0] + delta_x
         self.real_pos[1] = self.init_pos[1] + delta_y
 
@@ -269,6 +268,9 @@ class PPTracker:
         pixel_y = int((real_y * self.depth_camera_controller.fy_d) / real_z + self.depth_camera_controller.cy_d)
 
         return pixel_x, pixel_y
+
+    def is_any_point_missing(self):
+        return self.pp_diff_tip == None or self.pp_diff_bottom == None
     
     def pixel_to_real_position(self, pixel_x, pixel_y, depth_data):
         real_z = self.get_depth_of_pixel(pixel_x, pixel_y, depth_data)
@@ -282,8 +284,10 @@ class PPTracker:
     
     def calculate_pp_diff_positions(self, white_pixel_centers, depth_data):
         
+        pp_pixel_positions = self.get_pixel_positions(white_pixel_centers)
+        if pp_pixel_positions == None:
+            return None
         pp_pixel_bottom, pp_pixel_tip = self.get_pixel_positions(white_pixel_centers)
-
 
         self.pp_diff_tip = self.pixel_to_diff(pp_pixel_tip[0], pp_pixel_tip[1], depth_data)
         self.pp_diff_bottom = self.pixel_to_diff(pp_pixel_bottom[0], pp_pixel_bottom[1], depth_data)
@@ -346,9 +350,12 @@ class PPTracker:
         v_x = initial_speed * math.cos(math.radians(vertical_angle)) * math.cos(math.radians(horizontal_angle))
         v_y = initial_speed * math.cos(math.radians(vertical_angle)) * math.sin(math.radians(horizontal_angle))
         v_z = initial_speed * math.sin(math.radians(vertical_angle))
+        #ensure v_z is oriented correctly, and negative v_z is equal to going down
 
         # Solve for time of flight using quadratic formula
         # z(t) = z0 + v_z * t - 0.5 * g * t^2
+
+        #arranged position formula to a quadratic equation with format x(t) = at^2 + bt + c
         a = -0.5 * g
         b = v_z
         c = start_height_from_toilet
@@ -357,7 +364,7 @@ class PPTracker:
         discriminant = b**2 - 4 * a * c
         if discriminant < 0:
             print("No real solution: the object will not hit the ground.")
-            return None, None, None, None
+            return None
 
         elapsed_time = (-b + math.sqrt(discriminant)) / (2 * a)  # Take the positive root
         current_time = time.time()
@@ -368,7 +375,7 @@ class PPTracker:
         y_land = diff_y - v_y * elapsed_time
 
         # Return the landing position and time
-        return x_land, y_land, self.toilet_height_m, landing_time
+        return x_land, y_land, landing_time
 
 class DepthCameraController:
     def __init__(self):
@@ -417,6 +424,9 @@ class ModeTracker:
     
     def is_tracking(self):
         return self.mode == self.mode_list[1]
+
+    def is_setting_origin(self):
+        return self.mode == self.mode_list[0]
     
 class UIHandler:
     def __init__(self, pp_tracker, mode_tracker, toilet_controller):
@@ -424,7 +434,6 @@ class UIHandler:
         self.mode_tracker = mode_tracker
         cv2.namedWindow('Human Vision')
         cv2.namedWindow('Reflective Tape')
-
         self.cursor_pixel_pos = [0,0]
         self.toilet_controller = toilet_controller
         self.move_requested = False
@@ -516,7 +525,7 @@ class UIHandler:
         cursor_y = self.cursor_pixel_pos[1]
         cv2.arrowedLine(gopro_image, (render_data['toilet_pixel_x'], render_data['toilet_pixel_y']), (cursor_x, cursor_y), arrow_color, 2)
 
-    def compute_toilet_render_data(self, gopro_image, landing_real_x, landing_real_y, landing_real_z):
+    def compute_toilet_render_data(self, gopro_image, landing_real_x, landing_real_y):
         toilet_gopro_pixel_x, toilet_gopro_pixel_y, thresh = self.toilet_controller.get_pixel_position(gopro_image)
         toilet_gopro_real_x, toilet_gopro_real_y = self.toilet_controller.pixel_to_real(toilet_gopro_pixel_x, toilet_gopro_pixel_y)
         
@@ -529,8 +538,8 @@ class UIHandler:
             #ensure landing_real units are in mm
             landing_real_x *= 1000
             landing_real_y *= 1000
+            #because toilet_controller can convert real position to pixel position if the real position is at the toilet height, use the toilet real to pixel function
             landing_pixel_x, landing_pixel_y = self.toilet_controller.real_to_pixel(landing_real_x, landing_real_y)
-            print(f'{landing_pixel_x} {landing_pixel_y}')
 
         render_data = {
             'toilet_gopro_pixel_x': toilet_gopro_pixel_x,
@@ -561,19 +570,17 @@ class UIHandler:
         text_real = f"Predicted Landing Pos: ({render_data['landing_real_x']:.2f} m, {render_data['landing_real_y']:.2f} m at )"
         cv2.putText(gopro_image, text_real, (render_data['landing_pixel_x'] + 20, render_data['landing_pixel_y'] - 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 4)
 
-    def draw_toilet_ui(self, gopro_image, landing_real_x, landing_real_y, landing_real_z):
-        render_data = self.compute_toilet_render_data(gopro_image, landing_real_x, landing_real_y, landing_real_z)
+    def draw_toilet_ui(self, gopro_image, landing_real_x, landing_real_y):
+        render_data = self.compute_toilet_render_data(gopro_image, landing_real_x, landing_real_y)
 
         self.render_outdated_toilet_pos(gopro_image, render_data)
         self.render_correct_toilet_pos(gopro_image, render_data)
         self.render_arrow(gopro_image, render_data)
         self.render_toilet_bounds(gopro_image)
         self.render_landing_location(gopro_image, render_data)
-
         self.display_toilet_feed(gopro_image, render_data['thresh'])
 
 try:
-
     obs_virtual_camera_index = 3 
     gopro_feed = cv2.VideoCapture(obs_virtual_camera_index, cv2.CAP_DSHOW)
     if not gopro_feed.isOpened():
@@ -604,15 +611,16 @@ try:
     ui_handler = UIHandler(pp_tracker, mode_tracker, toilet_controller)
 
     while True:
-        #pp logic
+        #------------------------------------------------------capture PP data
+
         depth_data, depth_image, color_image = depth_camera_controller.get_depth_and_color_frames()
         white_pixels = pp_tracker.get_white_pixels(color_image)
         white_pixel_centers = pp_tracker.get_centers_of_white_pixels(white_pixels)
         white_pixel_center_count = len(white_pixel_centers)
 
-        landing_x, landing_y, landing_z, landing_time = None, None, None, None
+        landing_x, landing_y, landing_time = None, None, None
 
-        if not mode_tracker.is_tracking():
+        if mode_tracker.is_setting_origin():
             if white_pixel_center_count == 1:
                 origin_pixel_x, origin_pixel_y = white_pixel_centers[0]
                 origin_point = pp_tracker.pixel_to_real_position(origin_pixel_x, origin_pixel_y, depth_data)
@@ -625,44 +633,58 @@ try:
             else:
                 ui_handler.draw_invalid_origin_text(color_image, white_pixel_center_count)
 
-        elif white_pixel_center_count == 2:
-            
-            pp_tracker.calculate_pp_diff_positions(white_pixel_centers, depth_data)
-            if pp_tracker.get_diff_tip_position() == None:
-                print("Skipping frame: Unable to compute diff_tip_position.")
-                continue
-            pp_tracker.calculate_pp_orientation()
-            pp_diff_x, pp_diff_y, pp_diff_z = pp_tracker.get_diff_tip_position()
-            pp_initial_speed = pp_tracker.get_initial_speed()
-            pp_vertical_angle = pp_tracker.get_vertical_angle()
-            pp_horizontal_angle = pp_tracker.get_horizontal_angle()
-            if pp_vertical_angle == None:
-                print("vertical angle not real number, skipping")
-                continue
+        elif mode_tracker.is_tracking():
+            if white_pixel_center_count == 2:
+                pp_tracker.calculate_pp_diff_positions(white_pixel_centers, depth_data)
+                if pp_tracker.is_any_point_missing():
+                    print("SKIPPING FRAME: missing at least one point even though white_pixel_center_count is 2")
+                    continue
 
-            landing_x, landing_y, landing_z, landing_time = pp_tracker.calculate_landing_location_at_toilet_height(pp_diff_x, pp_diff_y, pp_diff_z, pp_initial_speed, pp_horizontal_angle, pp_vertical_angle)
+                #grab pp variables needed to calculate pp trajectory
+                pp_tracker.calculate_pp_orientation()
+                pp_diff_x, pp_diff_y, pp_diff_z = pp_tracker.get_diff_tip_position()
+                pp_initial_speed = pp_tracker.get_initial_speed()
+                pp_vertical_angle = pp_tracker.get_vertical_angle()
+                pp_horizontal_angle = pp_tracker.get_horizontal_angle()
 
-            ui_handler.draw_tracking_ui(color_image, white_pixel_centers)
+                #predict pp trajectory
+                pp_landing_info = pp_tracker.calculate_landing_location_at_toilet_height(pp_diff_x, pp_diff_y, pp_diff_z, pp_initial_speed, pp_horizontal_angle, pp_vertical_angle)
+
+                if pp_landing_info:
+                    landing_x, landing_y, landing_time = pp_landing_info
+                else:
+                    print("ERROR: error while calculating PP trajectory")
+
+                ui_handler.draw_tracking_ui(color_image, white_pixel_centers)
+            else:
+                print("SKIPPING FRAME: expected 2 points but found a different amount")
+                continue
 
         ui_handler.display_pp_feed(color_image, white_pixels)
 
-        #toilet logic
+
+
+
+        #----------------------------------------------move toilet
+
         ret, gopro_image = gopro_feed.read()
+
         if not ret:
-            print("Error: Failed to capture image")
+            print("SKIPPING FRAME: Failed to capture gopro frame")
+            continue
 
         toilet_controller.update_velocity(gopro_image)
         
         if toilet_controller.is_still():
             if not recently_stopped:
-                print("toilet just stopped")
+                print("toilet just stopped moving")
                 toilet_controller.resync_position(gopro_image)
                 recently_stopped = True
         else:
             recently_stopped = False
 
 
-        ui_handler.draw_toilet_ui(gopro_image, landing_x, landing_y, landing_z)
+        ui_handler.draw_toilet_ui(gopro_image, landing_x, landing_y)
 
         #quit button / render cv2
         if cv2.waitKey(1) & 0xFF == ord('q'):
