@@ -231,7 +231,7 @@ class PPTracker:
         masked_gray_image = cv2.bitwise_and(gray_image, mask)
 
         # Thresholding to find bright spots (retroreflective tape)
-        _, thresh = cv2.threshold(masked_gray_image, 252, 255, cv2.THRESH_BINARY)
+        _, thresh = cv2.threshold(masked_gray_image, 253, 255, cv2.THRESH_BINARY)
         
         # Clean up
         kernel_size = 7
@@ -335,7 +335,7 @@ class PPTracker:
         return f"Bottle Tip: ({self.pp_diff_tip[0]:.2f}m, {self.pp_diff_tip[1]:.2f}m, {self.pp_diff_tip[2]:.2f}m)"
     
     def get_initial_speed(self):
-        return self.arduino_handler.get_pee_initial_speed() * 0.2
+        return self.arduino_handler.get_pee_initial_speed() *2
     
     def velocity_text(self):
         return f"Velocity: {self.get_initial_speed():.2f} m/s"
@@ -432,20 +432,20 @@ class UIHandler:
     def __init__(self, pp_tracker, mode_tracker, toilet_controller):
         self.pp_tracker = pp_tracker
         self.mode_tracker = mode_tracker
-        cv2.namedWindow('Human Vision')
-        cv2.namedWindow('Reflective Tape')
+        cv2.namedWindow('PP: Human Vision')
+        cv2.namedWindow('PP: Computer Vision')
         self.cursor_pixel_pos = [0,0]
         self.toilet_controller = toilet_controller
         self.move_requested = False
-        cv2.namedWindow('Video Stream')
-        cv2.setMouseCallback('Video Stream', self.mouse_callback)
+        cv2.namedWindow('Toilet: Human Vision')
+        cv2.setMouseCallback('Toilet: Human Vision', self.mouse_callback)
         self.cursor_inside_bounds = False
         self.polygon = np.array(toilet_controller.pixel_coords, np.int32).reshape((-1, 1, 2))
         self.direction = [0,0]
 
     def display_pp_feed(self, color_image, thresh):
-        cv2.imshow('Human Vision', color_image)
-        cv2.imshow('Reflective Tape', thresh)
+        cv2.imshow('PP: Human Vision', color_image)
+        cv2.imshow('PP: Computer Vision', thresh)
     
     def draw_origin_text(self, color_image):
         cv2.putText(color_image, "Valid origin! Press 'o' to set origin point", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
@@ -503,9 +503,9 @@ class UIHandler:
         thresh_resized = cv2.resize(thresh, (thresh.shape[1] // 2, thresh.shape[0] // 2))
 
         # Display the original frame with the detected white pixels
-        cv2.imshow('Video Stream', frame_resized)
+        cv2.imshow('Toilet: Human Vision', frame_resized)
         # Display the thresholded image
-        cv2.imshow('Thresholded Image', thresh_resized)
+        cv2.imshow('Toilet: Computer Vision', thresh_resized)
 
     def render_outdated_toilet_pos(self, gopro_image, render_data):
         cv2.circle(gopro_image, (render_data['toilet_gopro_pixel_x'], render_data['toilet_gopro_pixel_y']), 5, (0, 255, 0), -1)
@@ -637,7 +637,7 @@ try:
             if white_pixel_center_count == 2:
                 pp_tracker.calculate_pp_diff_positions(white_pixel_centers, depth_data)
                 if pp_tracker.is_any_point_missing():
-                    print("SKIPPING FRAME: missing at least one point even though white_pixel_center_count is 2")
+                    print("ERROR: missing at least one point even though white_pixel_center_count is 2")
                     continue
 
                 #grab pp variables needed to calculate pp trajectory
@@ -657,13 +657,9 @@ try:
 
                 ui_handler.draw_tracking_ui(color_image, white_pixel_centers)
             else:
-                print("SKIPPING FRAME: expected 2 points but found a different amount")
-                continue
+                print("ERROR: expected 2 points but found a different amount, unable to track pp location")
 
         ui_handler.display_pp_feed(color_image, white_pixels)
-
-
-
 
         #----------------------------------------------move toilet
 
