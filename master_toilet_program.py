@@ -129,9 +129,6 @@ class ToiletController:
 
         return False
     
-    def move_to_pp_target_pos(self):
-        pp_target_pos_m = pp_tracker.get_smoothed_target_pos()
-    
 class ArduinoHandler:
     def __init__(self):
         self.lock = threading.Lock()
@@ -194,22 +191,11 @@ class PPTracker:
         self.vertical_angle = None
         self.horizontal_angle = None
         self.toilet_height_m = 0.33
+        self.pee_speed_history_size = 10
+        self.pee_speed_history = deque(maxlen=self.pee_speed_history_size)
 
-        self.target_pos_history_size = 10
-        self.target_pos_x_history = deque(maxlen=self.target_pos_history_size)
-        self.target_pos_y_history = deque(maxlen=self.target_pos_history_size)
-        self.latest_target_pos_x = None
-        self.latest_target_pos_y = None
-
-    def add_latest_predicted_target_pos(self, x, y):
-        self.latest_target_pos_x = x
-        self.target_pos_x_history.append(x)
-
-        self.latest_target_pos_y = y
-        self.target_pos_y_history.append(y)
-
-    def get_latest_predicted_target_pos(self):
-        return (self.latest_target_pos_x, self.latest_target_pos_y)
+    def get_horizontal_angle(self):
+        return self.horizontal_angle
 
     def get_vertical_angle(self):
         return self.vertical_angle
@@ -242,29 +228,6 @@ class PPTracker:
     def get_pixel_tip_position(self, white_pixel_centers):
         _ , pp_pixel_tip = self.get_pixel_positions(white_pixel_centers)
         return pp_pixel_tip
-
-    def get_smoothed_target_pos_mm(self):
-        smoothed_target_real_pos_x, smoothed_target_real_pos_y = self.get_smoothed_target_pos() # in meters
-
-        if smoothed_target_real_pos_x and smoothed_target_real_pos_y:
-            smoothed_target_real_pos_x *= 1000
-            smoothed_target_real_pos_y *= 1000
-            return smoothed_target_real_pos_x, smoothed_target_real_pos_y
-        else:
-            return None
-    
-    def get_smoothed_target_pos(self):
-        if not self.target_pos_x_history or not self.target_pos_x_history:
-            return None
-
-        smoothed_target_x = sum(self.target_pos_x_history) / len(self.target_pos_x_history)
-        smoothed_target_y = sum(self.target_pos_y_history) / len(self.target_pos_y_history)
-
-        return smoothed_target_x, smoothed_target_y
-
-    def get_smoothed_vertical_angle(self, latest_vertical_angle):
-        self.pee_vertical_angle_history.append(latest_vertical_angle)
-        return sum(self.pee_vertical_angle_history) / len(self.pee_vertical_angle_history)
     
     def get_white_pixels(self, color_image):
         # Convert color image to grayscale
@@ -482,12 +445,12 @@ class UIHandler:
         cv2.namedWindow('PP: Computer Vision')
         self.cursor_pixel_pos = [0,0]
         self.toilet_controller = toilet_controller
-        #self.move_requested = False
+        self.move_requested = False
         cv2.namedWindow('Toilet: Human Vision')
-        #cv2.setMouseCallback('Toilet: Human Vision', self.mouse_callback)
-        self.target_inside_bounds = False
+        cv2.setMouseCallback('Toilet: Human Vision', self.mouse_callback)
+        self.cursor_inside_bounds = False
         self.polygon = np.array(toilet_controller.pixel_coords, np.int32).reshape((-1, 1, 2))
-        self.direction = [0,0] 
+        self.direction = [0,0]
 
     def display_pp_feed(self, color_image, thresh):
         cv2.imshow('PP: Human Vision', color_image)
@@ -521,7 +484,7 @@ class UIHandler:
     def update_cursor_pos(self, x, y):
         self.cursor_pixel_pos[0] = x * 2
         self.cursor_pixel_pos[1] = y * 2
-        self.target_inside_bounds = cv2.pointPolygonTest(self.polygon, self.cursor_pixel_pos, False) >= 0
+        self.cursor_inside_bounds = cv2.pointPolygonTest(self.polygon, self.cursor_pixel_pos, False) >= 0
 
     def get_real_cursor_pos(self):
         return self.toilet_controller.pixel_to_real(self.cursor_pixel_pos[0], self.cursor_pixel_pos[1])
@@ -535,7 +498,7 @@ class UIHandler:
     
     def move_toilet_to_mouse(self):
         cursor_real_delta_x, cursor_real_delta_y = self.get_toilet_cursor_real_deltas()
-        if self.target_inside_bounds:
+        if self.cursor_inside_bounds:
             self.toilet_controller.move_relative(cursor_real_delta_x, cursor_real_delta_y)    
 
     def mouse_callback(self, event, x, y, flags, param):
@@ -566,23 +529,26 @@ class UIHandler:
         cv2.putText(gopro_image, text_real, (render_data['toilet_pixel_x'] + 20, render_data['toilet_pixel_y'] - 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 4)
 
     def render_arrow(self, gopro_image, render_data):
-        arrow_color = (255, 0 , 0) if self.target_inside_bounds else (0, 0, 255)
+        arrow_color = (255, 0 , 0) if self.cursor_inside_bounds else (0, 0, 255)
         cursor_x = self.cursor_pixel_pos[0]
         cursor_y = self.cursor_pixel_pos[1]
         cv2.arrowedLine(gopro_image, (render_data['toilet_pixel_x'], render_data['toilet_pixel_y']), (cursor_x, cursor_y), arrow_color, 2)
-    
-    def compute_toilet_render_data(self, gopro_image):
+
+    def compute_toilet_render_data(self, gopro_image, landing_real_x, landing_real_y):
         toilet_gopro_pixel_x, toilet_gopro_pixel_y, thresh = self.toilet_controller.get_pixel_position(gopro_image)
         toilet_gopro_real_x, toilet_gopro_real_y = self.toilet_controller.pixel_to_real(toilet_gopro_pixel_x, toilet_gopro_pixel_y)
         
         toilet_real_x, toilet_real_y = self.toilet_controller.get_real_position()
         toilet_pixel_x, toilet_pixel_y = self.toilet_controller.real_to_pixel(toilet_real_x, toilet_real_y)
 
-        smoothed_target_pos_mm = self.pp_tracker.get_pp_target_pos_mm()
-        target_pixel_pos_x, target_pixel_pos_y = None, None
-
-        if smoothed_target_pos_mm:
-            target_pixel_pos_x, target_pixel_pos_y = self.toilet_controller.real_to_pixel(smoothed_target_pos_mm[0], smoothed_target_pos_mm[1])
+        if landing_real_x == None or landing_real_y == None:
+            landing_pixel_x, landing_pixel_y = None, None
+        else:
+            #ensure landing_real units are in mm
+            landing_real_x *= 1000
+            landing_real_y *= 1000
+            #because toilet_controller can convert real position to pixel position if the real position is at the toilet height, use the toilet real to pixel function
+            landing_pixel_x, landing_pixel_y = self.toilet_controller.real_to_pixel(landing_real_x, landing_real_y)
 
         render_data = {
             'toilet_gopro_pixel_x': toilet_gopro_pixel_x,
@@ -594,10 +560,10 @@ class UIHandler:
             'toilet_pixel_x': toilet_pixel_x,
             'toilet_pixel_y': toilet_pixel_y,
             'thresh': thresh,
-            'landing_pixel_x': target_pixel_pos_x,
-            'landing_pixel_y': target_pixel_pos_y,
-            'landing_real_x': smoothed_target_pos_mm[0],
-            'landing_real_y': smoothed_target_pos_mm[1]
+            'landing_pixel_x': landing_pixel_x,
+            'landing_pixel_y': landing_pixel_y,
+            'landing_real_x': landing_real_x,
+            'landing_real_y': landing_real_y
         }
 
         return render_data
@@ -613,8 +579,8 @@ class UIHandler:
         text_real = f"Predicted Landing Pos: ({render_data['landing_real_x']:.2f} m, {render_data['landing_real_y']:.2f} m at )"
         cv2.putText(gopro_image, text_real, (render_data['landing_pixel_x'] + 20, render_data['landing_pixel_y'] - 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 4)
 
-    def draw_toilet_ui(self, gopro_image):
-        render_data = self.compute_toilet_render_data(gopro_image)
+    def draw_toilet_ui(self, gopro_image, landing_real_x, landing_real_y):
+        render_data = self.compute_toilet_render_data(gopro_image, landing_real_x, landing_real_y)
 
         self.render_outdated_toilet_pos(gopro_image, render_data)
         self.render_correct_toilet_pos(gopro_image, render_data)
@@ -660,7 +626,8 @@ try:
         white_pixels = pp_tracker.get_white_pixels(color_image)
         white_pixel_centers = pp_tracker.get_centers_of_white_pixels(white_pixels)
         white_pixel_center_count = len(white_pixel_centers)
-        pp_landing_info = None
+
+        landing_x, landing_y, landing_time = None, None, None
 
         if mode_tracker.is_setting_origin():
             if white_pixel_center_count == 1:
@@ -680,20 +647,23 @@ try:
                 pp_tracker.calculate_pp_diff_positions(white_pixel_centers, depth_data)
                 if pp_tracker.is_any_point_missing():
                     print("ERROR: missing at least one point even though white_pixel_center_count is 2")
-                else:
-                    #grab pp variables needed to calculate pp trajectory
-                    pp_tracker.calculate_pp_orientation()
-                    pp_diff_x, pp_diff_y, pp_diff_z = pp_tracker.get_diff_tip_position()
-                    pp_initial_speed = pp_tracker.get_initial_speed()
-                    pp_vertical_angle = pp_tracker.get_vertical_angle()
-                    pp_horizontal_angle = pp_tracker.get_horizontal_angle()
-                    #predict pp trajectory
-                    pp_landing_info = pp_tracker.calculate_landing_location_at_toilet_height(pp_diff_x, pp_diff_y, pp_diff_z, pp_initial_speed, pp_horizontal_angle, pp_vertical_angle)
+                    continue
 
-                    if pp_landing_info:
-                        pp_tracker.add_latest_predicted_target_pos(pp_landing_info[0], pp_landing_info[1])
-                    else:
-                        print("ERROR: error while calculating PP trajectory")
+                #grab pp variables needed to calculate pp trajectory
+                pp_tracker.calculate_pp_orientation()
+                pp_diff_x, pp_diff_y, pp_diff_z = pp_tracker.get_diff_tip_position()
+                pp_initial_speed = pp_tracker.get_initial_speed()
+                pp_smoothed_speed = pp_tracker.get_smoothed_speed(pp_initial_speed)
+                pp_vertical_angle = pp_tracker.get_vertical_angle()
+                pp_horizontal_angle = pp_tracker.get_horizontal_angle()
+
+                #predict pp trajectory
+                pp_landing_info = pp_tracker.calculate_landing_location_at_toilet_height(pp_diff_x, pp_diff_y, pp_diff_z, pp_smoothed_speed, pp_horizontal_angle, pp_vertical_angle)
+
+                if pp_landing_info:
+                    landing_x, landing_y, landing_time = pp_landing_info
+                else:
+                    print("ERROR: error while calculating PP trajectory")
 
                 ui_handler.draw_tracking_ui(color_image, white_pixel_centers)
             else:
@@ -713,22 +683,16 @@ try:
         
         if toilet_controller.is_still():
             if not recently_stopped:
-                print("toilet arrived at pp target location")
+                print("toilet just stopped moving")
                 toilet_controller.resync_position(gopro_image)
-                print("toilet position synced with encoders")
-                pp_tracker.get_smoothed_target_pos_mm()
-                toilet_controller.move_relative()
-                print("toilet moving to target location")
                 recently_stopped = True
-                
 
                 print("make toilet move now")
         else:
             recently_stopped = False
 
-        
 
-        ui_handler.draw_toilet_ui(gopro_image)
+        ui_handler.draw_toilet_ui(gopro_image, landing_x, landing_y)
 
         #quit button / render cv2
         if cv2.waitKey(1) & 0xFF == ord('q'):
