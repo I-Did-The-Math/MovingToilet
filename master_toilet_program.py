@@ -191,12 +191,25 @@ class PPTracker:
         self.vertical_angle = None
         self.horizontal_angle = None
         self.toilet_height_m = 0.33
-
-    def get_vertical_angle(self):
-        return self.vertical_angle
+        self.pee_speed_history_size = 10
+        self.pee_speed_history = deque(maxlen=self.pee_speed_history_size)
 
     def get_horizontal_angle(self):
         return self.horizontal_angle
+
+    def get_vertical_angle(self):
+        return self.vertical_angle
+    
+    def get_smoothed_vertical_angle(self, latest_vertical_angle):
+        self.pee_vertical_angle_history.append(latest_vertical_angle)
+        return sum(self.pee_vertical_angle_history) / len(self.pee_vertical_angle_history)
+    
+    def get_initial_speed(self):
+        return self.arduino_handler.get_pee_initial_speed()
+    
+    def get_smoothed_speed(self, latest_speed):
+        self.pee_speed_history.append(latest_speed)
+        return sum(self.pee_speed_history) / len(self.pee_speed_history)
 
     def get_diff_tip_position(self):
         return self.pp_diff_tip
@@ -215,10 +228,6 @@ class PPTracker:
     def get_pixel_tip_position(self, white_pixel_centers):
         _ , pp_pixel_tip = self.get_pixel_positions(white_pixel_centers)
         return pp_pixel_tip
-
-    def get_smoothed_vertical_angle(self, latest_vertical_angle):
-        self.pee_vertical_angle_history.append(latest_vertical_angle)
-        return sum(self.pee_vertical_angle_history) / len(self.pee_vertical_angle_history)
     
     def get_white_pixels(self, color_image):
         # Convert color image to grayscale
@@ -226,15 +235,15 @@ class PPTracker:
 
         # Mask the bottom half of the image
         height, _ = gray_image.shape
-        mask = np.zeros_like(gray_image)
+        mask = np.zeros_like(gray_image) 
         mask[:height // 2, :] = 255
         masked_gray_image = cv2.bitwise_and(gray_image, mask)
 
         # Thresholding to find bright spots (retroreflective tape)
-        _, thresh = cv2.threshold(masked_gray_image, 253, 255, cv2.THRESH_BINARY)
+        _, thresh = cv2.threshold(masked_gray_image, 251, 255, cv2.THRESH_BINARY)
         
         # Clean up
-        kernel_size = 7
+        kernel_size = 5
         kernel = np.ones((kernel_size, kernel_size), c_uint8)
         thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
         return thresh
@@ -334,9 +343,6 @@ class PPTracker:
             return f"Bottle Tip: (N/A, N/A, N/A)"
         return f"Bottle Tip: ({self.pp_diff_tip[0]:.2f}m, {self.pp_diff_tip[1]:.2f}m, {self.pp_diff_tip[2]:.2f}m)"
     
-    def get_initial_speed(self):
-        return self.arduino_handler.get_pee_initial_speed() *2
-    
     def velocity_text(self):
         return f"Velocity: {self.get_initial_speed():.2f} m/s"
     
@@ -345,6 +351,9 @@ class PPTracker:
 
         # Calculate initial height above the ground
         start_height_from_toilet = diff_z - self.toilet_height_m
+
+        #adjust initial speed
+        initial_speed *= 0.35
 
         # Decompose initial velocity into components
         v_x = initial_speed * math.cos(math.radians(vertical_angle)) * math.cos(math.radians(horizontal_angle))
@@ -644,11 +653,12 @@ try:
                 pp_tracker.calculate_pp_orientation()
                 pp_diff_x, pp_diff_y, pp_diff_z = pp_tracker.get_diff_tip_position()
                 pp_initial_speed = pp_tracker.get_initial_speed()
+                pp_smoothed_speed = pp_tracker.get_smoothed_speed(pp_initial_speed)
                 pp_vertical_angle = pp_tracker.get_vertical_angle()
                 pp_horizontal_angle = pp_tracker.get_horizontal_angle()
 
                 #predict pp trajectory
-                pp_landing_info = pp_tracker.calculate_landing_location_at_toilet_height(pp_diff_x, pp_diff_y, pp_diff_z, pp_initial_speed, pp_horizontal_angle, pp_vertical_angle)
+                pp_landing_info = pp_tracker.calculate_landing_location_at_toilet_height(pp_diff_x, pp_diff_y, pp_diff_z, pp_smoothed_speed, pp_horizontal_angle, pp_vertical_angle)
 
                 if pp_landing_info:
                     landing_x, landing_y, landing_time = pp_landing_info
@@ -676,6 +686,8 @@ try:
                 print("toilet just stopped moving")
                 toilet_controller.resync_position(gopro_image)
                 recently_stopped = True
+
+                print("make toilet move now")
         else:
             recently_stopped = False
 
