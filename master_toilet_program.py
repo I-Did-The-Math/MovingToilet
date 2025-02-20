@@ -20,6 +20,7 @@ class ToiletController:
         self.just_stopped = False
         self.just_stopped_time = None
         self.pos_synced = True
+        
 
         # Coordinates in mm
         self.real_coords = np.array([
@@ -37,8 +38,12 @@ class ToiletController:
             [798, 142]
         ])
 
+        self.movement_bounds = np.array(self.real_coords, np.int32).reshape((-1, 1, 2))
         self.H, _ = cv2.findHomography(self.pixel_coords, self.real_coords)
         self.H_inv = np.linalg.inv(self.H)  #Inverse homography matrix for real world to pixel conversion
+
+    def real_point_inside_bounds(self, x, y):
+        return cv2.pointPolygonTest(self.movement_bounds, (x,y), False) >= 0
 
     def update_velocity(self, gopro_image):
         current_time = time.time()
@@ -113,9 +118,24 @@ class ToiletController:
     def move_relative(self, delta_x, delta_y):
         self.arduino_handler.move(delta_x, delta_y)
 
+    def convert_m_to_mm(self, x):
+            return x * 1000
+
+    def move_to_position(self, target_x, target_y):
+        current_x, current_y = self.get_real_position()
+        delta_x = target_x - current_x
+        delta_y = target_y - current_y
+
+        distance_to_target = math.sqrt(delta_x**2 + delta_y**2)
+
+        if distance_to_target > 15: 
+            self.move_relative(delta_x, delta_y)
+            return True
+        return False
+
     def is_still(self):
         still_threshold = 15
-        still_duration_threshold = 0.1
+        still_duration_threshold = 0.3
 
         if self.velocity < still_threshold:
             if not self.just_stopped:
@@ -339,7 +359,7 @@ class PPTracker:
         return f"Vertical Angle: {self.vertical_angle:.2f} deg\nHorizontal Angle: {self.horizontal_angle:.2f} deg"
     
     def coord_text(self):
-        if self.pp_diff_tip == None:
+        if self.pp_diff_tip == None: 
             return f"Bottle Tip: (N/A, N/A, N/A)"
         return f"Bottle Tip: ({self.pp_diff_tip[0]:.2f}m, {self.pp_diff_tip[1]:.2f}m, {self.pp_diff_tip[2]:.2f}m)"
     
@@ -463,7 +483,6 @@ class UIHandler:
         cv2.putText(color_image, f'Invalid number of points detected: {count}', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
 
     def draw_tracking_ui(self, color_image, white_pixel_centers):
-
         angle_text = self.pp_tracker.angle_text()
         y0, dy = 15, 15
         for i, line in enumerate(angle_text.split('\n')):
@@ -484,7 +503,9 @@ class UIHandler:
     def update_cursor_pos(self, x, y):
         self.cursor_pixel_pos[0] = x * 2
         self.cursor_pixel_pos[1] = y * 2
-        self.cursor_inside_bounds = cv2.pointPolygonTest(self.polygon, self.cursor_pixel_pos, False) >= 0
+
+        real_x, real_y = toilet_controller.pixel_to_real(self.cursor_pixel_pos[0], self.cursor_pixel_pos[1])
+        self.cursor_inside_bounds = cv2.pointPolygonTest(toilet_controller.movement_bounds, (real_x, real_y ), False) >= 0
 
     def get_real_cursor_pos(self):
         return self.toilet_controller.pixel_to_real(self.cursor_pixel_pos[0], self.cursor_pixel_pos[1])
@@ -614,6 +635,7 @@ try:
     
     toilet_controller.resync_position(gopro_image)
     recently_stopped = False
+    toilet_awaiting_movement_command = False
     
     mode_tracker = ModeTracker()
 
@@ -676,7 +698,7 @@ try:
         ret, gopro_image = gopro_feed.read()
 
         if not ret:
-            print("SKIPPING FRAME: Failed to capture gopro frame")
+            print("SKIPPING FRAME: Failed to capture gopro frame") 
             continue
 
         toilet_controller.update_velocity(gopro_image)
@@ -686,11 +708,17 @@ try:
                 print("toilet just stopped moving")
                 toilet_controller.resync_position(gopro_image)
                 recently_stopped = True
-
-                print("make toilet move now")
+                toilet_awaiting_movement_command  = True
+            if toilet_awaiting_movement_command:
+                if landing_x and landing_y:
+                    landing_x_mm = toilet_controller.convert_m_to_mm(landing_x)
+                    landing_y_mm = toilet_controller.convert_m_to_mm(landing_y)
+                    if toilet_controller.real_point_inside_bounds(landing_x_mm, landing_y_mm):
+                        if toilet_controller.move_to_position(landing_x_mm, landing_y_mm):
+                            toilet_awaiting_movement_command = False
         else:
             recently_stopped = False
-
+            toilet_awaiting_movement_command = False
 
         ui_handler.draw_toilet_ui(gopro_image, landing_x, landing_y)
 
