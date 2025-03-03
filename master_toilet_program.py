@@ -14,7 +14,7 @@ class ToiletController:
         self.real_pos = [0.0,0.0]
         self.init_pos = [0.0,0.0]
         self.last_pixel_pos = [0,0]
-        self.velocity = 0.0
+        self.gopro_velocity = 0.0
         self.pixel_pos_history = []
         self.last_velocity_check_time = time.time()
         self.just_stopped = False
@@ -45,6 +45,9 @@ class ToiletController:
     def real_point_inside_bounds(self, x, y):
         return cv2.pointPolygonTest(self.movement_bounds, (x,y), False) >= 0
 
+    def get_encoder_velocity(self):
+        self.arduino_handler
+
     def update_velocity(self, gopro_image):
         current_time = time.time()
         time_diff = current_time - self.last_velocity_check_time
@@ -53,7 +56,7 @@ class ToiletController:
             vel_x = (pixel_x - self.last_pixel_pos[0]) / time_diff
             vel_y = (pixel_y - self.last_pixel_pos[1]) / time_diff
 
-            self.velocity = math.sqrt(vel_x**2 + vel_y**2)
+            self.gopro_velocity = math.sqrt(vel_x**2 + vel_y**2)
 
             self.last_pixel_pos[0] = pixel_x
             self.last_pixel_pos[1] = pixel_y
@@ -137,7 +140,7 @@ class ToiletController:
         still_threshold = 15
         still_duration_threshold = 0.3
 
-        if self.velocity < still_threshold:
+        if self.gopro_velocity < still_threshold:
             if not self.just_stopped:
                 self.just_stopped = True
                 self.just_stopped_time = time.time()
@@ -148,6 +151,73 @@ class ToiletController:
             self.just_stopped_time = None
 
         return False
+
+    def move_to_position_relative(self,move_x, move_y):
+        current_delta_x, current_delta_y = self.arduino_handler.get_deltas()
+        target_x = current_delta_x + move_x
+        target_y = current_delta_y + move_y
+
+        angle = math.tan2(abs(move_y), abs(move_x))
+        normalizedAngle = abs(math.sin(2 * angle))
+        speedAdjustmentFactor = 0.8 + 0.2 * normalizedAngle
+
+        print("New movement started: deltaX=")
+        print(move_x)
+        print(", deltaY=")
+        print(move_y)
+        self.executePIDControl(target_x, target_y, speedAdjustmentFactor)
+
+    def executePIDControl(self, target_x, target_y, speedAdjustmentFactor):
+        Kp = 0.01
+        current_delta_x, current_delta_y = self.arduino_handler.get_deltas()
+        velocity = self.arduino_handler.get_velocity()
+
+        errorX = target_x - current_delta_x
+        errorY = target_y - current_delta_y
+        distance_left_to_travel = math.sqrt(errorX * errorX + errorY * errorY)
+
+        output = Kp * distance_left_to_travel * speedAdjustmentFactor
+
+        # Normalize the direction vector
+        directionX = errorX / distance_left_to_travel
+        directionY = errorY / distance_left_to_travel
+        
+        #determine breaking
+        slowDownDistance = velocity * velocity / 7500
+        
+        if (distance_left_to_travel < slowDownDistance) and slowDown == False:
+            slowDown = True
+
+        speedMultiplier = 1
+
+        if slowDown:
+            speedAdjustmentFactor = 1
+            minPower = 15
+            if velocity > 300:
+                speedMultiplier = 0
+
+        initialMinPower = 50
+
+        # cos will be 1 for orthogonal, 0 for diagonal
+        speed = 0
+        output += minPower
+
+        def constrain(value, min_value, max_value):
+            return max(min_value, min(value, max_value))
+
+        maxPower = 60
+        speed =  speedMultiplier *  constrain(output, minPower , maxPower) * speedAdjustmentFactor
+        minPower = initialMinPower
+        
+        self.arduino_handler.move_direction(directionX, directionY, speed)
+        
+        #Check if the target position is reached
+        closeEnoughThreshold = 2
+        slowEnoughThreshold = 50
+        if distance_left_to_travel < closeEnoughThreshold and velocity < slowEnoughThreshold: # Adjust the threshold as needed
+            slowDown = False
+            self.arduino_handler.move_direction(0, 0, 0) # Stop the motors
+            print("done")
     
 class ArduinoHandler:
     def __init__(self):
@@ -157,9 +227,22 @@ class ArduinoHandler:
         self.baud_rate = 2000000
         self.serial = serial.Serial(self.serial_port, self.baud_rate)
 
+        self.last_velocity_check = time.time
+
+        #in mm
         self.delta_x = 0.0
         self.delta_y = 0.0
+        self.last_delta_x = 0.0
+        self.last_delta_y = 0.0
+        self.total_distance = 0.0
+        self.velocity_update_interval = 1
+
+        #in mm/s
+        self.velocity = 0.0
+        
+        #in m/s
         self.pee_initial_speed = 0.0
+
 
     def get_deltas(self):
         return self.delta_x, self.delta_y
@@ -167,21 +250,56 @@ class ArduinoHandler:
     def get_pee_initial_speed(self):
         return self.pee_initial_speed
 
+    def get_velocity(self):
+        return self.velocity
+
     def start_reading(self):
         threading.Thread(target=self.read_serial_data, daemon=True).start()
+
+    def start_checking_velocity(self):
+        threading.Thread(target=self.update_velocity, daemon=True).start()
+
+    def update_velocity(self):
+        while True:
+            if time.time - self.last_velocity_check >= self.velocity_update_interval:
+                time_delta = time.time - self.last_velocity_check
+
+                current_delta_x, current_delta_y = self.get_deltas()
+
+                diff_x = current_delta_x - self.last_delta_x
+                diff_y = current_delta_y - self.last_delta_y
+
+                delta_increment_distance = math.sqrt(math.pow(abs(diff_x),2) + math.pow(abs(diff_y),2))
+            
+                self.velocity = delta_increment_distance / time_delta
+
+                self.last_delta_x = current_delta_x
+                self.last_delta_y = current_delta_y
 
     def read_serial_data(self):
         while True:
             with self.lock:
-                #print("holding lock from serial")
                 if self.serial.in_waiting > 0:
                     line = self.serial.readline().decode('utf-8').strip()
-                    #print(f"Received line: {line}")
+                    #format from arduino: X,[deltaX],Y,[deltaY]
                     if "X," in line:
                         parts = line.split(",")
+
+                        last_delta_x = self.delta_x
+                        last_delta_y = self.delta_y
+                        
                         self.delta_x = float(parts[1]) * 0.9
                         self.delta_y = float(parts[3])
 
+                        delta_x_increment = self.delta_x - last_delta_x
+                        delta_y_increment = self.delta_y - last_delta_y
+                        delta_x_abs_increment = abs(delta_x_increment)
+                        delta_y_abs_increment = abs(delta_y_increment)
+
+                        total_movement_increment = delta_x_abs_increment + delta_y_abs_increment
+                        self.total_distance += total_movement_increment
+
+                        print(f'deltaX: {self.delta_x} deltaY: {self.delta_y} totalDistance: {self.total_distance}')
                     if "V:" in line:
                         self.pee_initial_speed = float(line.split(" ")[1])
                     
@@ -192,10 +310,17 @@ class ArduinoHandler:
             time.sleep(0.1)
             self.delta_x = 0
             self.delta_y = 0
+            self.total_distance = 0
 
     def move(self,delta_x, delta_y):
         with self.lock:
             command = f"{delta_x},{delta_y}\n"
+            self.serial.write(command.encode())
+            print(f"Sent: {command}")
+
+    def move_direction(self, direction_x, direction_y, speed):
+        with self.lock:
+            command = f'{direction_x},{direction_y},{speed}'
             self.serial.write(command.encode())
             print(f"Sent: {command}")
 
@@ -629,6 +754,7 @@ try:
     
     arduino_handler = ArduinoHandler()
     arduino_handler.start_reading()
+    arduino_handler.start_checking_velocity()
 
     toilet_controller = ToiletController(arduino_handler)
     pp_tracker = PPTracker(arduino_handler, depth_camera_controller)
