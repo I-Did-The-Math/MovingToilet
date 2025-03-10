@@ -20,6 +20,12 @@ class ToiletController:
         self.just_stopped = False
         self.just_stopped_time = None
         self.pos_synced = True
+
+        self.target_x = 0
+        self.target_y = 0
+        self.speedAdjustmentFactor = 0
+
+        self.movementInProgress = False
         
 
         # Coordinates in mm
@@ -157,68 +163,85 @@ class ToiletController:
         target_x = current_delta_x + move_x
         target_y = current_delta_y + move_y
 
-        angle = math.tan2(abs(move_y), abs(move_x))
+        angle = math.atan2(abs(move_y), abs(move_x))
         normalizedAngle = abs(math.sin(2 * angle))
         speedAdjustmentFactor = 0.8 + 0.2 * normalizedAngle
+
+        self.target_x = target_x
+        self.target_y = target_y
+        self.speedAdjustmentFactor = speedAdjustmentFactor
 
         print("New movement started: deltaX=")
         print(move_x)
         print(", deltaY=")
         print(move_y)
-        self.executePIDControl(target_x, target_y, speedAdjustmentFactor)
 
-    def executePIDControl(self, target_x, target_y, speedAdjustmentFactor):
+        self.movementInProgress = True
+
+    def initialize_PID_thread(self):
+        threading.Thread(target=self.executePIDControl, daemon=True).start()
+
+    def executePIDControl(self):
+        slowDown = False
         Kp = 0.01
-        current_delta_x, current_delta_y = self.arduino_handler.get_deltas()
-        velocity = self.arduino_handler.get_velocity()
-
-        errorX = target_x - current_delta_x
-        errorY = target_y - current_delta_y
-        distance_left_to_travel = math.sqrt(errorX * errorX + errorY * errorY)
-
-        output = Kp * distance_left_to_travel * speedAdjustmentFactor
-
-        # Normalize the direction vector
-        directionX = errorX / distance_left_to_travel
-        directionY = errorY / distance_left_to_travel
-        
-        #determine breaking
-        slowDownDistance = velocity * velocity / 7500
-        
-        if (distance_left_to_travel < slowDownDistance) and slowDown == False:
-            slowDown = True
-
-        speedMultiplier = 1
-
-        if slowDown:
-            speedAdjustmentFactor = 1
-            minPower = 15
-            if velocity > 300:
-                speedMultiplier = 0
-
         initialMinPower = 50
-
-        # cos will be 1 for orthogonal, 0 for diagonal
-        speed = 0
-        output += minPower
-
-        def constrain(value, min_value, max_value):
-            return max(min_value, min(value, max_value))
-
-        maxPower = 60
-        speed =  speedMultiplier *  constrain(output, minPower , maxPower) * speedAdjustmentFactor
         minPower = initialMinPower
-        
-        self.arduino_handler.move_direction(directionX, directionY, speed)
-        
-        #Check if the target position is reached
+        maxPower = 60
         closeEnoughThreshold = 2
         slowEnoughThreshold = 50
-        if distance_left_to_travel < closeEnoughThreshold and velocity < slowEnoughThreshold: # Adjust the threshold as needed
-            slowDown = False
-            self.arduino_handler.move_direction(0, 0, 0) # Stop the motors
-            print("done")
-    
+        movement_loop_interval = 0.01
+        last_iteration_time = time.time()
+
+        while self.movementInProgress:
+            if time.time() - last_iteration_time >= movement_loop_interval:
+                last_iteration_time = time.time()
+                current_delta_x, current_delta_y = self.arduino_handler.get_deltas()
+                velocity = self.arduino_handler.get_velocity()
+
+                errorX = self.target_x - current_delta_x
+                errorY = self.target_y - current_delta_y
+                distance_left_to_travel = math.sqrt(errorX * errorX + errorY * errorY)
+
+                output = Kp * distance_left_to_travel * self.speedAdjustmentFactor
+
+                # Normalize the direction vector
+                directionX = errorX / distance_left_to_travel
+                directionY = errorY / distance_left_to_travel
+                
+                #determine breaking
+                slowDownDistance = velocity * velocity / 7500
+                
+                if (distance_left_to_travel < slowDownDistance) and slowDown == False:
+                    slowDown = True
+
+                speedMultiplier = 1
+
+                if slowDown:
+                    speedAdjustmentFactor = 1
+                    minPower = 15
+                    if velocity > 300:
+                        speedMultiplier = 0
+
+                # cos will be 1 for orthogonal, 0 for diagonal
+                speed = 0
+                output += minPower
+
+                def constrain(value, min_value, max_value):
+                    return max(min_value, min(value, max_value))
+                
+                speed =  speedMultiplier * constrain(output, minPower, maxPower) * speedAdjustmentFactor
+                minPower = initialMinPower
+                
+                self.arduino_handler.move_direction(directionX, directionY, speed)
+                
+                #Check if the target position is reached
+                if distance_left_to_travel < closeEnoughThreshold and velocity < slowEnoughThreshold: # Adjust the threshold as needed
+                    slowDown = False
+                    self.arduino_handler.move_direction(0, 0, 0) # Stop the motors
+                    self.movementInProgress = False
+                    print("done")
+            time.sleep(0.001)
+        
 class ArduinoHandler:
     def __init__(self):
         self.lock = threading.Lock()
@@ -227,7 +250,10 @@ class ArduinoHandler:
         self.baud_rate = 2000000
         self.serial = serial.Serial(self.serial_port, self.baud_rate)
 
-        self.last_velocity_check = time.time
+
+        #in seconds
+        self.last_velocity_check = time.time()
+        self.velocity_update_interval = 0.001
 
         #in mm
         self.delta_x = 0.0
@@ -235,7 +261,7 @@ class ArduinoHandler:
         self.last_delta_x = 0.0
         self.last_delta_y = 0.0
         self.total_distance = 0.0
-        self.velocity_update_interval = 1
+        
 
         #in mm/s
         self.velocity = 0.0
@@ -261,8 +287,8 @@ class ArduinoHandler:
 
     def update_velocity(self):
         while True:
-            if time.time - self.last_velocity_check >= self.velocity_update_interval:
-                time_delta = time.time - self.last_velocity_check
+            if time.time() - self.last_velocity_check >= self.velocity_update_interval:
+                time_delta = time.time() - self.last_velocity_check
 
                 current_delta_x, current_delta_y = self.get_deltas()
 
@@ -275,6 +301,7 @@ class ArduinoHandler:
 
                 self.last_delta_x = current_delta_x
                 self.last_delta_y = current_delta_y
+            time.sleep(0.001)
 
     def read_serial_data(self):
         while True:
@@ -302,6 +329,7 @@ class ArduinoHandler:
                         print(f'deltaX: {self.delta_x} deltaY: {self.delta_y} totalDistance: {self.total_distance}')
                     if "V:" in line:
                         self.pee_initial_speed = float(line.split(" ")[1])
+                time.sleep(0.001)
                     
     def reset_encoders(self):
         with self.lock:
@@ -645,7 +673,7 @@ class UIHandler:
     def move_toilet_to_mouse(self):
         cursor_real_delta_x, cursor_real_delta_y = self.get_toilet_cursor_real_deltas()
         if self.cursor_inside_bounds:
-            self.toilet_controller.move_relative(cursor_real_delta_x, cursor_real_delta_y)    
+            self.toilet_controller.move_to_position_relative(cursor_real_delta_x, cursor_real_delta_y)    
 
     def mouse_callback(self, event, x, y, flags, param):
         if event == cv2.EVENT_MOUSEMOVE:
@@ -757,6 +785,7 @@ try:
     arduino_handler.start_checking_velocity()
 
     toilet_controller = ToiletController(arduino_handler)
+    toilet_controller.initialize_PID_thread()
     pp_tracker = PPTracker(arduino_handler, depth_camera_controller)
     
     toilet_controller.resync_position(gopro_image)
