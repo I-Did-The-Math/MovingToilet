@@ -192,8 +192,8 @@ class ToiletController:
         movement_loop_interval = 0.01
         last_iteration_time = time.time()
 
-        while self.movementInProgress:
-            if time.time() - last_iteration_time >= movement_loop_interval:
+        while True: 
+            if self.movementInProgress and time.time() - last_iteration_time >= movement_loop_interval:
                 last_iteration_time = time.time()
                 current_delta_x, current_delta_y = self.arduino_handler.get_deltas()
                 velocity = self.arduino_handler.get_velocity()
@@ -217,7 +217,7 @@ class ToiletController:
                 speedMultiplier = 1
 
                 if slowDown:
-                    speedAdjustmentFactor = 1
+                    self.speedAdjustmentFactor = 1
                     minPower = 15
                     if velocity > 300:
                         speedMultiplier = 0
@@ -229,7 +229,7 @@ class ToiletController:
                 def constrain(value, min_value, max_value):
                     return max(min_value, min(value, max_value))
                 
-                speed =  speedMultiplier * constrain(output, minPower, maxPower) * speedAdjustmentFactor
+                speed =  speedMultiplier * constrain(output, minPower, maxPower) * self.speedAdjustmentFactor
                 minPower = initialMinPower
                 
                 self.arduino_handler.move_direction(directionX, directionY, speed)
@@ -240,7 +240,7 @@ class ToiletController:
                     self.arduino_handler.move_direction(0, 0, 0) # Stop the motors
                     self.movementInProgress = False
                     print("done")
-            time.sleep(0.001)
+            time.sleep(0.01)
         
 class ArduinoHandler:
     def __init__(self):
@@ -329,7 +329,7 @@ class ArduinoHandler:
                         print(f'deltaX: {self.delta_x} deltaY: {self.delta_y} totalDistance: {self.total_distance}')
                     if "V:" in line:
                         self.pee_initial_speed = float(line.split(" ")[1])
-                time.sleep(0.001)
+            time.sleep(0.001)
                     
     def reset_encoders(self):
         with self.lock:
